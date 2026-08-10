@@ -63,9 +63,8 @@ COPY docs/CLAUDE_PROMPT.md docs/ENVIRONMENT_VARIABLES.md docs/INTERNALS.md docs/
 COPY README.md ./README.md
 COPY CHANGELOG.md ./CHANGELOG.md
 
-# Persistent mount point: bucket data
-# 持久化挂载点：记忆数据
-VOLUME ["/app/buckets"]
+# Persistent storage is mounted by the deployment platform at /app/buckets.
+# 持久化存储由部署平台挂载到 /app/buckets，避免 Railway 不支持的 VOLUME 指令。
 
 # Default to streamable-http for container (remote access)
 # 容器场景默认用 streamable-http
