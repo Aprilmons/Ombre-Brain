@@ -24,6 +24,12 @@ Railway 健康检查设置为 `/health`、超时 300 秒，同时必须显式配
 
 此升级保留自主普通记忆说明与 `source_read` 精确原文核对，并保留 Railway 不使用 Docker `VOLUME` 指令的适配；`You` / `Them` 默认关闭，升级不主动启用。请通过固定 testing 提交的隔离容器验证后再发布 main，禁止用真实记忆执行测试。
 
+## ClockworkKoi 3.6.16 引语修正
+
+引语的公开 MCP 参数使用对象数组，原话放 `text`，说话人放 `speaker`，时间放 `at`。`user` / `assistant` 是内置称呼；实际姓名或昵称分别登记到配置的 `attribution.user_names` / `attribution.self_names`。身份在读取时判定，补齐称呼后无需重写旧引语。
+
+本次部署在旧实例停止、持久卷独占后，先核验已有 `before-3.6.15` 迁移前完整快照，并为当前配置单独保存私有只读副本及 SHA256；不把已有 3.x 数据冒充迁移前快照。随后通过 `atomic_update_config_yaml` 向现有 `attribution.user_names` 追加 Rocky、April，保留其他配置并回读核验。配置修正完成后恢复正常启动命令。仍使用现有 `OMBRE_CONFIG_PATH`、`OMBRE_BUCKETS_DIR`、`OMBRE_VAULT_DIR`、`OMBRE_CODE_DIR`、`OMBRE_IMAGE_ROOT`，没有新增生产环境变量，也不改记忆或数据库格式。
+
 ## 安全部署向导
 
 首次登录后打开 `/onboarding`，只选择部署意图：

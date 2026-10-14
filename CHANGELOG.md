@@ -2,6 +2,12 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 3.6.16（ClockworkKoi 定制）
+
+- `hold.quotes` 与 `trace.quotes_replace` 的工具说明及使用示例统一为对象数组，与公开 MCP 参数定义一致；底层仍保留字符串简写兼容。
+- 明确引语的 `user` / `assistant` 归属及姓名、昵称的配置方式；第一人称记忆不改变原话的说话人。
+- 部署时在现有 `attribution.user_names` 中追加 Rocky、April，保留其他配置及旧引语原文。
+
 ## 3.6.15（ClockworkKoi 定制）
 
 基于上游 3.6.14（`115d831d979bf67efc7150f976e2cb34c333c935`），从定制 2.16.10 升级。
