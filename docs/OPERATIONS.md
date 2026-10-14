@@ -20,6 +20,8 @@ python /app/deploy/clockworkkoi_upgrade_guard.py restore --backup-id before-3.6.
 
 恢复命令先保存当前完整状态，再在全新目录中生成旧快照副本和私有 `RESTORE_MAP.json`；不覆盖活动记忆。按映射将数据、配置和代码路径切换到恢复副本，同时部署匹配的旧提交 `8632dd3551961532f4dda87492d65f6c469c7c42`。生产单根布局下，新数据路径为上述目标内的 `root-0`，配置与 `_app` 相应位于其中。恢复前生成的当前状态快照必须保留，以便核对升级后新增的记忆。跨主版本或版本未知的 `_prev` 自动回退被明确阻止，需按上述步骤恢复成套数据与代码。
 
+Railway 健康检查设置为 `/health`、超时 300 秒，同时必须显式配置平台变量 `PORT=8000`，与 Docker 默认 `OMBRE_PORT=8000` 和域名 target port 8000 一致。平台健康检查读取 `PORT`，不会自动跟随域名的 target port；遗漏时应用内部正常，发布仍会报 service unavailable。
+
 此升级保留自主普通记忆说明与 `source_read` 精确原文核对，并保留 Railway 不使用 Docker `VOLUME` 指令的适配；`You` / `Them` 默认关闭，升级不主动启用。请通过固定 testing 提交的隔离容器验证后再发布 main，禁止用真实记忆执行测试。
 
 ## 安全部署向导
