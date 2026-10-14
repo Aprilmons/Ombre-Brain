@@ -321,10 +321,10 @@ async def test_long_breath_dehydrates_once_then_uses_model_scoped_cache(
     sonnet._cache_conn.close()
 
 
-def test_write_tool_descriptions_require_explicit_memory_intent():
+def test_bulk_write_and_destructive_tool_descriptions_keep_boundaries():
     source = (ROOT / "src" / "server.py").read_text(encoding="utf-8")
 
-    assert "不要因普通聊天、猜测或工具名称联想而自行调用" in source
+    # 普通 hold 可主动积累；批量整理与删除操作保留各自的边界。
     assert "不要根据普通聊天自行推断写入意图" in source
     assert "不要猜测 bucket_id 或自行改写记忆" in source
     assert "hard_delete=True 仅用于清理创建时明确标记 test_data=True 的测试桶" in source
