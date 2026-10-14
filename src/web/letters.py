@@ -79,6 +79,8 @@ def register(mcp) -> None:
                 key=lambda b: b["metadata"].get("letter_date") or b["metadata"].get("created", ""),
                 reverse=True,
             )
+            store = getattr(sh, "deletion_requests", None)
+            deletion_statuses = store.status_snapshot() if store else {}
             result = []
             for b in letters:
                 state = letter_lock_state(b, "human")
@@ -91,7 +93,9 @@ def register(mcp) -> None:
                     )
                     if not b:
                         continue
-                result.append(safe_letter_metadata(b, "human"))
+                item = safe_letter_metadata(b, "human")
+                item["deletion_request"] = deletion_statuses.get(str(b["id"]))
+                result.append(item)
             return JSONResponse({"letters": result, "total": len(result)})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
@@ -438,31 +442,16 @@ def register(mcp) -> None:
         if bucket and not is_letter_bucket(bucket):
             return JSONResponse({"error": "letter not found"}, status_code=404)
         try:
-            # Idempotent repair for a half-deleted letter: the Markdown file may
-            # already be gone while the active cache/vector still exposes it.
-            # Archive a real letter when present, then independently clean every
-            # derived layer even when no file remains.
-            archived = bool(bucket) and await sh.bucket_mgr.delete(letter_id)
-            if bucket and not archived:
-                return JSONResponse({"error": "letter archive failed"}, status_code=500)
-            outbox = getattr(sh.bucket_mgr, "embedding_outbox", None)
-            if outbox is not None:
-                try:
-                    outbox.discard(letter_id)
-                except Exception:
-                    pass
             try:
-                sh.embedding_engine.delete_embedding(letter_id)
+                body = await sh._read_json_object(request)
             except Exception:
-                pass
-            invalidate = getattr(sh.bucket_mgr, "_invalidate_bm25", None)
-            if callable(invalidate):
-                invalidate()
-            return JSONResponse({
-                "ok": True,
-                "deleted": archived,
-                "cleaned": True,
-                "already_missing": not bool(bucket),
-            })
+                body = {}
+            result = await sh.deletion_requests.submit(
+                letter_id, body.get("reason", ""), is_letter=True
+            )
+            if not result.get("ok"):
+                status = 404 if result.get("code") == "not_found" else 409 if result.get("code") in {"pending_exists", "daily_limit", "lifetime_limit"} else 400
+                return JSONResponse(result, status_code=status)
+            return JSONResponse(result)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)

@@ -16,10 +16,10 @@ jobs:
     env:
       UV_VERSION: '0.11.23'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -63,7 +63,7 @@ jobs:
           --output-file sbom.cdx.json
 
       - name: Upload dependency SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ombre-brain-python-sbom
           path: sbom.cdx.json
@@ -126,7 +126,7 @@ jobs:
             sleep 1
           done
 
-      - name: Run 15-tool Docker MCP integration suite
+      - name: Run Docker MCP integration suite
         env:
           OMBRE_DOCKER_INTEGRATION_URL: http://127.0.0.1:18084/mcp
           OMBRE_DOCKER_EXPECT_COMPRESSION_PROVIDER: "1"

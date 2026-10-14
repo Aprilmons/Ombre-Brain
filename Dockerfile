@@ -53,6 +53,7 @@ COPY frontend/ ./frontend/
 COPY VERSION ./VERSION
 COPY config.example.yaml ./config.default.yaml
 COPY entrypoint.sh ./entrypoint.sh
+COPY deploy/clockworkkoi_upgrade_guard.py ./deploy/clockworkkoi_upgrade_guard.py
 RUN chmod +x ./entrypoint.sh
 
 # 面向用户的说明文档：Docker 用户本地无源码、镜像此前也不含这些文件，
@@ -60,11 +61,16 @@ RUN chmod +x ./entrypoint.sh
 # 出现「服务装完了但模型没拿到使用约定」的 onboarding 断点。内部设计稿
 # （docs/superpowers、docs/secrets 等）不在此列，仍被 .dockerignore 挡在外面。
 COPY docs/CLAUDE_PROMPT.md docs/ENVIRONMENT_VARIABLES.md docs/INTERNALS.md docs/MULTI_OWNER.md docs/OPERATIONS.md ./docs/
+# ADR 与 preflight CLI：两项系统诊断（adr_requirements / preflight_cli_diagnostics）
+# 在运行时目录下分别读 docs/adr/ 与 tools/vnext_preflight.py。镜像此前不含这两处，
+# 诊断在任何 Docker 部署上都报 not found / missing_files。
+COPY docs/adr/ ./docs/adr/
+COPY tools/ ./tools/
+COPY kernel/ ./kernel/
 COPY README.md ./README.md
 COPY CHANGELOG.md ./CHANGELOG.md
 
-# Persistent storage is mounted by the deployment platform at /app/buckets.
-# 持久化存储由部署平台挂载到 /app/buckets，避免 Railway 不支持的 VOLUME 指令。
+# 持久化存储由 Railway 挂载到 /app/buckets，避免平台不支持的 VOLUME 指令。
 
 # Default to streamable-http for container (remote access)
 # 容器场景默认用 streamable-http

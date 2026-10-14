@@ -65,7 +65,7 @@ async def test_default_breath_falls_back_to_raw_pinned_content_when_dehydrate_re
 
 
 @pytest.mark.asyncio
-async def test_dream_includes_core_bucket_content_as_reference(bucket_mgr):
+async def test_dream_does_not_surface_pinned_bucket_content(bucket_mgr):
     bucket_id = await bucket_mgr.create(
         content="Pinned dream context must remain visible.",
         pinned=True,
@@ -75,8 +75,9 @@ async def test_dream_includes_core_bucket_content_as_reference(bucket_mgr):
 
     result = await dream_dispatch(window_hours=48)
 
-    assert bucket_id in result
-    assert "Pinned dream context must remain visible" in result
+    assert bucket_id not in result
+    assert "Pinned dream context must remain visible" not in result
+    assert "过去 48 小时内没有需要消化的新记忆" in result
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,6 @@
 """Red/blue regressions for the high-cost SessionStart memory hook."""
 
 import asyncio
-import base64
-import hashlib
-import json
-import re
 import threading
 
 import pytest
@@ -13,52 +9,23 @@ from utils import count_tokens_approx
 from web import hooks
 
 
-_OBM2_START = re.compile(
-    r"<<<OBM2 b=([0-9a-f]{24}) n=(\d+) h=([A-Za-z0-9_-]{43})>>>\n"
+# OBM2 紧凑安全信封（边界/哈希/协议说明）已整体删除（2026-08-11）：hook 返回的
+# 就是记忆正文本身，不带任何标记。以下断言改为直接检查正文干净、无任何
+# 遗留标记字样，以及受保护/未受保护内容的可见性边界仍然成立。
+_MARKER_STRINGS = (
+    "OBM2",
+    "boundary_id",
+    "content_role:stored_memory_data",
+    "payload_sha256",
+    "payload_chars",
+    "instructions:false",
+    "may_call_tools:false",
 )
 
 
-def _obm2_blocks(text: str) -> list[dict[str, object]]:
-    blocks: list[dict[str, object]] = []
-    cursor = 0
-    while match := _OBM2_START.search(text, cursor):
-        boundary, chars_text, digest = match.groups()
-        metadata_end = text.index("\n", match.end())
-        metadata_line = text[match.end():metadata_end]
-        assert metadata_line.startswith("m:")
-        metadata = json.loads(metadata_line.removeprefix("m:"))
-        assert metadata["a"] == "00"
-        assert metadata["k"] == "s"
-        assert isinstance(metadata["r"], str) and metadata["r"]
-        assert isinstance(metadata["p"], dict)
-        assert metadata["f"] in {"-", "t"}
-
-        payload_marker = "payload:\n"
-        payload_marker_at = metadata_end + 1
-        assert text.startswith(payload_marker, payload_marker_at)
-        payload_start = payload_marker_at + len(payload_marker)
-        declared_chars = int(chars_text)
-        payload = text[payload_start:payload_start + declared_chars]
-        assert len(payload) == declared_chars
-        expected_digest = base64.urlsafe_b64encode(
-            hashlib.sha256(payload.encode("utf-8")).digest()
-        ).decode("ascii").rstrip("=")
-        assert digest == expected_digest
-        assert len(base64.urlsafe_b64decode(digest + "=")) == 32
-        separator = "" if payload.endswith("\n") else "\n"
-        closing = f"<<<END_OBM2 b={boundary}>>>"
-        assert text.startswith(separator + closing, payload_start + len(payload))
-        cursor = payload_start + len(payload) + len(separator) + len(closing)
-        blocks.append(
-            {
-                "b": boundary,
-                "n": declared_chars,
-                "h": digest,
-                "m": metadata,
-                "payload": payload,
-            }
-        )
-    return blocks
+def _assert_no_markers(text: str) -> None:
+    for marker in _MARKER_STRINGS:
+        assert marker not in text, f"发现残留安全标记 {marker!r}，OBM2 应已整体删除"
 
 
 class _MCP:
@@ -182,9 +149,10 @@ async def test_hook_hides_digested_core_and_ordinary_memories(monkeypatch):
     dehydrator = _EchoDehydrator()
     buckets = [
         _bucket("visible-core", "Visible core memory.", pinned=True),
+        # 3.2.0 起：核心准则不可被消化，hook 注入也一样。
         _bucket(
             "digested-core",
-            "Digested core memory must stay hidden.",
+            "Digested core memory must stay visible.",
             pinned=True,
             digested=True,
         ),
@@ -202,9 +170,11 @@ async def test_hook_hides_digested_core_and_ordinary_memories(monkeypatch):
     assert response.status_code == 200
     assert "Visible core memory" in text
     assert "Visible ordinary memory" in text
-    assert "Digested core memory" not in text
     assert "Digested ordinary memory" not in text
-    assert dehydrator.calls == 2
+    # ⚠️ 3.2.0 有意推翻 2.8.4：pinned 桶带 digested 时仍然注入。
+    # 核心准则的意义就是始终在场；要让它安静，取消 pinned 而不是消化它。
+    assert "Digested core memory" in text
+    assert dehydrator.calls == 3
 
 
 @pytest.mark.asyncio
@@ -258,13 +228,12 @@ async def test_hook_never_injects_historical_protected_letter_or_self_memory(mon
 
     response = await _handler(monkeypatch, buckets, _EchoDehydrator())(_Request())
     text = response.body.decode("utf-8")
-    blocks = _obm2_blocks(text)
 
     assert response.status_code == 200
     assert "可见核心准则" in text
     assert "历史 protected Letter 正文不得注入" not in text
     assert "历史 protected I 正文不得注入" not in text
-    assert {block["m"]["p"]["bucket_id"] for block in blocks} == {"visible-core"}
+    _assert_no_markers(text)
 
 
 @pytest.mark.asyncio
@@ -280,27 +249,10 @@ async def test_hook_frames_injected_memory_letter_and_self_text_as_data(monkeypa
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
-    assert text.count("[OBM2] 下方") == 1
-    blocks = _obm2_blocks(text)
-    assert len(blocks) == 3
-    assert text.count("<<<OBM2 ") == 3
-    assert text.count("<<<END_OBM2 ") == 3
-    assert {block["m"]["r"] for block in blocks} == {
-        "core_memory_summary",
-        "recent_letter_excerpt",
-        "self_knowledge_excerpt",
-    }
-    assert {block["m"]["p"]["bucket_id"] for block in blocks} == {
-        "core",
-        "letter",
-        "self",
-    }
-    assert all(block["m"]["a"] == "00" for block in blocks)
-    assert all(block["m"]["k"] == "s" for block in blocks)
-    assert all(block["m"]["f"] == "-" for block in blocks)
-    assert all("x" not in block["m"] for block in blocks)
+    # 正文干净：三条历史记忆（核心准则/信件摘录/自我认知摘录）原样出现，
+    # 不附加任何边界、哈希或协议说明文字。
+    _assert_no_markers(text)
     assert text.count(injection) == 3
-    assert all(injection in block["payload"] for block in blocks)
 
 
 @pytest.mark.asyncio
@@ -485,24 +437,31 @@ async def test_public_hook_never_receives_locked_letter_content_or_notice(monkey
 @pytest.mark.asyncio
 async def test_hook_caps_provider_calls_and_final_render_budget(monkeypatch):
     dehydrator = _EchoDehydrator()
+    # hook 的 max_tokens 有 500 的配置下限（setting_int 的 minimum），OBM2
+    # 边界/哈希/协议说明整体删除后单条渲染成本大幅下降，短正文已经不足以在
+    # 500 token 内让预算先于 max_dehydrate_calls 生效——改用更长的正文，
+    # 让「预算」和「调用数上限」两条边界在这个配置下都仍然真实可验证。
+    long_memory = ("memory content that is long enough to cost real tokens. " * 6).strip()
     buckets = [
-        _bucket(f"core-{index}", "short memory", pinned=True, importance=10)
+        _bucket(f"core-{index}", long_memory, pinned=True, importance=10)
         for index in range(30)
     ]
+    max_tokens = 500
     response = await _handler(
         monkeypatch,
         buckets,
         dehydrator,
-        {"max_dehydrate_calls": 20, "max_tokens": 500},
+        {"max_dehydrate_calls": 20, "max_tokens": max_tokens},
     )(_Request())
     text = response.body.decode("utf-8")
 
     assert response.status_code == 200
     assert dehydrator.calls < 20
-    assert count_tokens_approx(text) <= 500
-    assert text.count("[OBM2] 下方") == 1
-    assert text.count("<<<OBM2 ") == dehydrator.calls
-    assert len(_obm2_blocks(text)) == dehydrator.calls
+    assert count_tokens_approx(text) <= max_tokens
+    _assert_no_markers(text)
+    # EchoDehydrator 原样返回正文，每条渲染出的核心准则摘要都带着这句原文；
+    # 出现次数应与实际发起的打标调用数一致。
+    assert text.count(long_memory) == dehydrator.calls
 
 
 @pytest.mark.asyncio

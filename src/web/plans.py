@@ -57,8 +57,8 @@ def register(mcp) -> None:
                     "name": meta.get("name") or "",
                     "content": b.get("content", ""),
                     "status": st,
-                    "created_at": meta.get("created_at"),
-                    "updated_at": meta.get("updated_at"),
+                    "created_at": meta.get("created"),
+                    "updated_at": meta.get("last_active"),
                     "related_bucket": meta.get("related_bucket"),
                     "change_log": meta.get("change_log") or [],
                     "tags": meta.get("tags") or [],
@@ -149,7 +149,11 @@ def register(mcp) -> None:
                     updates["status"] = new_status
                     history = append_plan_change_log(
                         history, "status",
-                        **{"from": old_status, "to": new_status},
+                        **{
+                            "from": old_status,
+                            "to": new_status,
+                            "by": "dashboard",
+                        },
                     )
             elif action == "edit":
                 new_content = body.get("content", "")
@@ -160,13 +164,16 @@ def register(mcp) -> None:
                 if size_err:
                     return JSONResponse({"error": size_err}, status_code=400)
                 updates["content"] = new_content.strip()
-                history = append_plan_change_log(history, "edit")
+                history = append_plan_change_log(history, "edit", by="dashboard")
             else:
                 return JSONResponse({"error": f"unknown action: {action}"}, status_code=400)
 
             # status 没变 且 不是 edit，成 noop。返回 200 + ok=true，不报错
             if not updates:
                 return JSONResponse({"ok": True, "noop": True})
+            # status 或正文经显式动作改变后，旧完成建议所依据的 plan 已失效。
+            # None 由 BucketManager 解释为删除 frontmatter 字段。
+            updates["resolution_suggested"] = None
             updates["change_log"] = history
             ok = await sh.bucket_mgr.update(bucket_id, **updates)
             if not ok:
@@ -185,7 +192,10 @@ def register(mcp) -> None:
             return JSONResponse({
                 "ok": True,
                 "id": bucket_id,
-                "updates": {k: v for k, v in updates.items() if k != "change_log"},
+                "updates": {
+                    k: v for k, v in updates.items()
+                    if k not in ("change_log", "resolution_suggested")
+                },
                 "cascaded_resolved": cascaded,
             })
         except ValueError as e:

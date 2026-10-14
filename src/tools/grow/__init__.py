@@ -19,6 +19,7 @@ grow 是「我把一段长内容整理进记忆」。短内容（<30 字）走 s
 ========================================
 """
 
+from errors import ToolInputError
 import re
 from typing import Optional
 
@@ -28,6 +29,7 @@ from .. import _runtime as rt
 from .._common import check_grow_input_size, check_grow_items_payload
 from .shortpath import grow_shortpath
 from .core import grow_core, grow_items
+from .retry_guard import request_fingerprint, run_once
 
 
 _TITLE_ANCHOR_SPLIT_RE = re.compile(
@@ -122,39 +124,59 @@ def _shifted_source_ranges_error(items: list, source_content: str) -> str:
     preview = "、".join(shifted_titles[:3])
     if len(shifted_titles) > 3:
         preview += " 等"
-    return (
-        "source_ranges 疑似与 items 错位："
+    raise ToolInputError("source_ranges 疑似与 items 错位："
         f"{preview} 的显式标题只在各自声明范围之外同向出现。"
         "为避免保存错误原文证据，本批次未创建任何桶；"
-        "请重新核对 1-based 闭区间。"
-    )
+        "请重新核对 1-based 闭区间。")
 
 
-async def dispatch(content: str = "", items: Optional[list] = None) -> str:
+async def dispatch(
+    content: str = "", items: Optional[list] = None, test_data: bool = False
+) -> str:
     await rt.decay_engine.ensure_started()
 
     # 预拆分模式：上层 AI 已拆好 N 条最终正文 → 逐字入库，跳过 digest 的二次改写。
     # 传了 items（非空列表）即走此路；不传则行为与旧版完全一致（向后兼容）。
     if isinstance(items, list) and len(items) > 0:
+        # 这四处校验都在 grow_items() 之前，失败时一个桶都没建。
+        # helper 保持返回错误串（它们在 _common.py 里被多处共用），
+        # 由调用点负责抛出——判据是「这次调用有没有写东西」。
         err = check_grow_items_payload(items)
         if err:
-            return err
+            raise ToolInputError(err)
         if content and content.strip():
             err = check_grow_input_size(content)
             if err:
-                return err
+                raise ToolInputError(err)
             err = _shifted_source_ranges_error(items, content)
             if err:
-                return err
-        return await grow_items(items, source_content=content)
+                raise ToolInputError(err)
+        fingerprint = request_fingerprint(
+            content=content, items=items, test_data=test_data
+        )
+        return await run_once(
+            fingerprint,
+            lambda: grow_items(
+                items, source_content=content, test_data=test_data
+            ),
+        )
 
     if not content or not content.strip():
-        return "内容为空，无法整理。"
+        raise ToolInputError("内容为空，无法整理。")
 
     err = check_grow_input_size(content)
     if err:
-        return err
+        raise ToolInputError(err)
 
+    fingerprint = request_fingerprint(
+        content=content, items=None, test_data=test_data
+    )
     if len(content.strip()) < 30:
-        return await grow_shortpath(content)
-    return await grow_core(content)
+        return await run_once(
+            fingerprint,
+            lambda: grow_shortpath(content, test_data=test_data),
+        )
+    return await run_once(
+        fingerprint,
+        lambda: grow_core(content, test_data=test_data),
+    )

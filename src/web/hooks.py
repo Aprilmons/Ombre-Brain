@@ -24,7 +24,7 @@ from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 
 from ombrebrain.policy.surfacing import SurfacePolicyVM
-from tools._common import memory_data_block, memory_data_protocol_header
+from tools.i import disputing_candidates, superseded_by
 from tools.plan.core import (
     is_letter_bucket,
     letter_lock_state,
@@ -163,33 +163,6 @@ def _bounded_text(value, limit: int = 200) -> str:
     return str(value or "")[:limit]
 
 
-def _hook_data_block(
-    bucket: dict,
-    payload: str,
-    *,
-    role: str,
-    content_verbatim: bool = False,
-    content_truncated: bool = False,
-) -> str:
-    """把记忆与脱水文本作为不可执行数据返回。"""
-
-    meta = bucket.get("metadata") or {}
-    provenance = {
-        "bucket_id": _bounded_text(bucket.get("id")),
-        "kind": "stored_memory",
-        "memory_type": _bounded_text(meta.get("type"), 32),
-        "created": _bounded_text(meta.get("created"), 40),
-        "source_tool": _bounded_text(meta.get("source_tool"), 80),
-    }
-    return memory_data_block(
-        role=role,
-        payload=payload,
-        provenance=provenance,
-        content_verbatim=content_verbatim,
-        content_truncated=content_truncated,
-    )
-
-
 @asynccontextmanager
 async def _timeout_after(seconds: float):
     """Python 3.10-compatible total timeout that preserves external cancel."""
@@ -307,10 +280,7 @@ def register(mcp) -> None:
                     reverse=True,
                 )
 
-                header = (
-                    "[Ombre Brain - 记忆浮现]\n"
-                    f"{memory_data_protocol_header()}\n"
-                )
+                header = "[Ombre Brain - 记忆浮现]\n"
                 remaining = token_budget - count_tokens_approx(header)
                 parts: list[str] = []
                 dehydrate_calls = 0
@@ -324,7 +294,7 @@ def register(mcp) -> None:
                     remaining -= cost
                     return True
 
-                async def append_summary(bucket: dict, *, role: str, prefix: str) -> bool:
+                async def append_summary(bucket: dict, *, prefix: str) -> bool:
                     nonlocal dehydrate_calls
                     if remaining < _HOOK_MIN_BLOCK_TOKENS:
                         return False
@@ -334,7 +304,6 @@ def register(mcp) -> None:
                     if dehydrate_calls >= max_dehydrate_calls:
                         return False
                     dehydrate_calls += 1
-                    truncated = False
                     try:
                         summary = await asyncio.wait_for(
                             sh.dehydrator.dehydrate(
@@ -350,25 +319,13 @@ def register(mcp) -> None:
                     except Exception as exc:
                         logger.warning("breath_hook dehydration failed: %s", exc)
                         summary = raw[:1200]
-                        truncated = len(summary) < len(raw)
                     summary = str(summary or "").strip()
                     if not summary:
                         summary = raw[:1200]
-                        truncated = len(summary) < len(raw)
-                    block = _hook_data_block(
-                        bucket,
-                        prefix + summary,
-                        role=role,
-                        content_truncated=truncated,
-                    )
-                    return append_block(block)
+                    return append_block(prefix + summary)
 
                 for bucket in pinned:
-                    if not await append_summary(
-                        bucket,
-                        role="core_memory_summary",
-                        prefix="📌 [核心准则] ",
-                    ):
+                    if not await append_summary(bucket, prefix="📌 [核心准则] "):
                         break
 
                 candidates = list(scored)
@@ -377,11 +334,7 @@ def register(mcp) -> None:
                     random.shuffle(pool)
                     candidates = [candidates[0], *pool]
                 for bucket in candidates[:20]:
-                    if not await append_summary(
-                        bucket,
-                        role="surfaced_memory_summary",
-                        prefix="",
-                    ):
+                    if not await append_summary(bucket, prefix=""):
                         break
 
                 letters = [
@@ -440,12 +393,7 @@ def register(mcp) -> None:
                         title = _bounded_text(meta.get("title") or meta.get("name"), 200)
                         excerpt = strip_wikilinks(str(letter.get("content") or ""))[:400]
                         append_block(
-                            _hook_data_block(
-                                letter,
-                                f"💌 [{tag}] {date}{(' · ' + title) if title else ''}\n{excerpt}",
-                                role="recent_letter_excerpt",
-                                content_truncated=len(excerpt) < len(strip_wikilinks(str(letter.get("content") or ""))),
-                            )
+                            f"💌 [{tag}] {date}{(' · ' + title) if title else ''}\n{excerpt}"
                         )
 
                     # Locked incoming Letters are an independent existence
@@ -467,7 +415,7 @@ def register(mcp) -> None:
                             )
 
                         for writer_name, incoming in incoming_by_writer.items():
-                            representative, state = incoming[0]
+                            _representative, state = incoming[0]
                             if len(incoming) > 1:
                                 notice = f"{writer_name}给你留了 {len(incoming)} 封仍未解锁的信。"
                             elif state["lock_type"] == "timed":
@@ -475,14 +423,7 @@ def register(mcp) -> None:
                                 notice = f"{writer_name}给你留了一封带锁的信，将于 {when} 解锁。"
                             else:
                                 notice = f"{writer_name}给你留了一封永久锁信，当前不可查看。"
-                            append_block(
-                                _hook_data_block(
-                                    representative,
-                                    notice,
-                                    role="locked_letter_notice",
-                                    content_truncated=False,
-                                )
-                            )
+                            append_block(notice)
 
                 self_buckets = [
                     bucket for bucket in all_buckets
@@ -497,7 +438,25 @@ def register(mcp) -> None:
                     key=lambda bucket: bucket["metadata"].get("created", ""),
                     reverse=True,
                 )
-                for bucket in self_buckets[:3]:
+
+                # 已被取代的、以及此刻正被自己的候选质疑的，都不占这三个名额。
+                #
+                # 这三条是模型每次开场读到的「我是谁」，读进去就是现在时的断言。
+                # 一条自己已经写下质疑的旧认识继续坐在这里，就是拿一个已知有疑的
+                # 信念当真理用——而且新的那条还在候选区排队，短期内换不上来。
+                # 挪走它不等于给不出答案：名额让给下一条真的还成立的认识。
+                buckets_by_id = {bucket["id"]: bucket for bucket in all_buckets}
+                live_disputes: list[str] = []
+                current_self: list[dict] = []
+                for bucket in self_buckets:
+                    if superseded_by(bucket):
+                        continue
+                    if disputing_candidates(bucket, buckets_by_id):
+                        live_disputes.append(bucket["id"])
+                        continue
+                    current_self.append(bucket)
+
+                for bucket in current_self[:3]:
                     meta = bucket["metadata"]
                     tags = meta.get("tags") or []
                     aspect = next(
@@ -510,14 +469,21 @@ def register(mcp) -> None:
                     )
                     raw = strip_wikilinks(str(bucket.get("content") or ""))
                     excerpt = raw[:300]
+                    # 早期条目是直写进来的，没经过任何碰撞。I(read=True) 一直
+                    # 标着这件事，而这里——模型每次会话开头真正形成自我感的
+                    # 那条路径——反而不标，于是没检验过的和沉淀下来的长得一样。
+                    origin = "" if meta.get("i_from_candidate") else "（未经沉淀）"
                     append_block(
-                        _hook_data_block(
-                            bucket,
-                            f"🪞{str(meta.get('created') or '')[:10]}"
-                            f"{f' [{aspect}]' if aspect else ''}\n{excerpt}",
-                            role="self_knowledge_excerpt",
-                            content_truncated=len(excerpt) < len(raw),
-                        )
+                        f"🪞{str(meta.get('created') or '')[:10]}"
+                        f"{f' [{aspect}]' if aspect else ''}{origin}\n{excerpt}"
+                    )
+
+                # 只说「你正在改这几条」，不把正文带回来——带回来就等于没挪走。
+                if live_disputes:
+                    append_block(
+                        f"🪞你正在改其中 {len(live_disputes)} 条对自己的看法"
+                        f"（{'、'.join(live_disputes[:3])}），"
+                        "新的还没沉淀下来。I(read=True) 能看到它们。"
                     )
 
                 if not parts:

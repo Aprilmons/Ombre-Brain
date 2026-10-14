@@ -2,6 +2,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from errors import ToolInputError
+
 import tools._runtime as rt
 from tools.breath.importance import _select_importance_buckets, surface_by_importance
 from tools.trace.core import trace_core
@@ -133,14 +135,16 @@ async def test_trace_importance_update_on_pinned_bucket_does_not_report_fake_suc
     )
     install_runtime(bucket_mgr)
 
-    result = await trace_core(bucket_id, importance=8)
+    # 这个测试的名字就叫「不能假报成功」——它一直想要的正是 isError=True。
+    with pytest.raises(ToolInputError) as excinfo:
+        await trace_core(bucket_id, importance=8)
     bucket = await bucket_mgr.get(bucket_id)
     breath = await surface_by_importance(importance_min=9, max_tokens=10000, tag_filter=[])
 
     assert bucket["metadata"]["importance"] == 10
     assert bucket_id in breath
-    assert "importance=8" not in result
-    assert "pinned" in result
+    assert "importance=8" not in str(excinfo.value)
+    assert "pinned" in str(excinfo.value)
 
 
 @pytest.mark.asyncio
@@ -176,10 +180,11 @@ async def test_trace_unprotect_requires_same_call_importance(bucket_mgr):
     )
     install_runtime(bucket_mgr)
 
-    rejected = await trace_core(bucket_id, protected=0)
+    with pytest.raises(ToolInputError) as excinfo:
+        await trace_core(bucket_id, protected=0)
     unchanged = await bucket_mgr.get(bucket_id)
 
-    assert "importance" in rejected
+    assert "importance" in str(excinfo.value)
     assert unchanged["metadata"]["protected"] is True
     assert unchanged["metadata"]["importance"] == 10
 
@@ -201,10 +206,11 @@ async def test_trace_rejects_protected_while_bucket_remains_pinned(bucket_mgr):
     )
     install_runtime(bucket_mgr)
 
-    result = await trace_core(bucket_id, protected=1)
+    with pytest.raises(ToolInputError) as excinfo:
+        await trace_core(bucket_id, protected=1)
     unchanged = await bucket_mgr.get(bucket_id)
 
-    assert "pinned" in result
+    assert "pinned" in str(excinfo.value)
     assert unchanged["metadata"]["pinned"] is True
     assert unchanged["metadata"].get("protected", False) is False
     assert unchanged["metadata"]["importance"] == 10

@@ -3,7 +3,7 @@ import pytest
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["hold", "grow", "trace", "breath", "pulse", "dream", "anchor", "I", "letter", "plan"],
+    ["hold", "grow", "trace", "breath", "pulse", "dream", "anchor", "I", "You", "letter", "plan", "feel"],
 )
 def test_public_tool_contract_accepts_normal_organ_tools(tool_name):
     from ombrebrain.protocol import PublicToolDesignContract, PublicToolSpec
@@ -21,6 +21,7 @@ def test_public_tool_contract_accepts_normal_organ_tools(tool_name):
         ("release", "anchor"),
         ("letter_write", "letter"),
         ("letter_read", "letter"),
+        ("source_read", "source_read"),
         ("letter_lock_update", "letter"),
     ],
 )

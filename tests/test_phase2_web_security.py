@@ -890,6 +890,7 @@ async def test_mcp_exception_secrets_never_reach_response_persistence_or_logs(
         "breath_advanced",
         "hold",
         "grow",
+        "source_read",
         "trace",
         "dream",
         "anchor",
@@ -903,11 +904,17 @@ async def test_mcp_exception_secrets_never_reach_response_persistence_or_logs(
     ),
 )
 def test_all_public_mcp_argument_models_forbid_unknown_fields(tool_name):
+    """所有公开工具都必须拒绝未知参数。
+
+    Pydantic 默认的 extra=ignore 会让拼错的参数看似调用成功——写工具甚至会在
+    未应用目标字段的情况下仍然创建记忆。信件 3.2.0 挂到 /mcp-extra、3.4.0 并回
+    主链路，两次搬家这条边界都必须跟着工具走。
+    """
     import server as server_mod
 
     public_tool = server_mod.mcp._tool_manager.get_tool(tool_name)
 
-    assert public_tool is not None
+    assert public_tool is not None, f"{tool_name} 在主连接器上找不到"
     assert public_tool.fn_metadata.arg_model.model_config.get("extra") == "forbid"
 
 
@@ -953,3 +960,48 @@ async def test_chunked_multipart_raw_stream_is_bounded_before_form_result():
 
     assert request.received == 2
     assert request._receive is request.original_receive
+
+
+def test_safe_error_detail_redacts_credential_forms():
+    """异常正文可以给出去，但三类常见凭证形态必须先抹掉。"""
+    from errors import safe_error_detail
+
+    detail = safe_error_detail(
+        RuntimeError(
+            "call failed: Authorization: Bearer abc123secret, "
+            "api_key=sk-livesecretvalue123456 at https://provider.invalid"
+        )
+    )
+
+    assert "abc123secret" not in detail
+    assert "sk-livesecretvalue123456" not in detail
+    assert "[REDACTED]" in detail
+    # 非凭证信息要保留，否则脱敏就等于把排查线索一起删了
+    assert "call failed" in detail
+
+
+def test_safe_error_detail_falls_back_and_bounds_length():
+    """空正文回落到异常类名；超长正文截断，避免把整页 traceback 塞给客户端。"""
+    from errors import safe_error_detail
+
+    assert safe_error_detail(RuntimeError("")) == "RuntimeError"
+    assert len(safe_error_detail(RuntimeError("x" * 5000))) <= 200
+
+
+@pytest.mark.asyncio
+async def test_tool_return_redacts_credentials_on_broad_failure(monkeypatch):
+    """工具层 broad-except 的回传不得把凭证原样送到 MCP 客户端。"""
+    import tools._runtime as rt
+    from tools.breath.catalog import surface_catalog
+
+    class ExplodingBucketMgr:
+        async def list_all(self, include_archive=False):
+            raise RuntimeError("disk backend rejected api_key=sk-livesecretvalue123456")
+
+    monkeypatch.setattr(rt, "bucket_mgr", ExplodingBucketMgr(), raising=False)
+
+    result = await surface_catalog()
+
+    assert "sk-livesecretvalue123456" not in result
+    assert "[REDACTED]" in result
+    assert "获取记忆目录失败" in result
