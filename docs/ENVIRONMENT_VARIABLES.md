@@ -34,6 +34,7 @@
 
 - `OMBRE_TRANSPORT`：`stdio` 或 `streamable-http`（legacy SSE 传输已于 2026-08-09 下线）。
 - `OMBRE_PORT`：容器或裸机监听端口。
+- `PORT`：Railway 的健康检查目标端口；本应用仍由 `OMBRE_PORT` 决定监听端口。部署使用 Docker 默认监听和域名 target port 8000 时，启用 `/health` 检查必须显式设置 `PORT=8000`，使平台检查与实际监听一致。
 - `OMBRE_BIND_HOST`：进程实际监听地址；容器/PaaS 通常需要 `0.0.0.0`，裸机仅限本机访问时应设为 `127.0.0.1`。
 - `OMBRE_MCP_REQUIRE_AUTH`：是否要求 MCP 鉴权。
 - `OMBRE_MCP_AUTH_MODE`：`oauth`、`token` 或 `hybrid`。`hybrid` 保留 OAuth 动态注册，同时让 `Authorization: Bearer` 也接受预置静态 Token；关闭鉴权仍由 `OMBRE_MCP_REQUIRE_AUTH=false` 控制。
