@@ -7,15 +7,17 @@ tools/dream/hints.py — dream 的连接提示、结晶提示与 I 候选碰撞�
 
 - 连接提示：在 recent 桶里找余弦相似度最高的一对（>0.5）→ 提示
   「这两个似乎有关联，不替你下结论，你自己想」
-- 结晶提示：扫所有 feel，发现某条 feel 与 ≥2 条其它 feel 相似度
-  >0.7 → 提示「你已经写过 N 条相似的 feel，可以考虑 hold(pinned=True)
-  升级它」
+- 结晶提示：低频触发——扫所有 feel，只有凑够 5 条互相相似（>0.7）的
+  feel 聚成一簇才提示「你已经写过 N 条相似的 feel，可以考虑
+  hold(pinned=True) 升级它」，避免每次 dream 都刷同一条提示
 - I 候选碰撞材料：把每条待沉淀的「我觉得……」和语义上最挨着的几条记忆
   摆在一起——支持它的、反驳它的、跟它撞车的其它候选，都只是材料
 
 关键行为：
 - 都依赖 embedding_engine.enabled；未启用时返回空串 / 空材料并明说
 - protected 只防衰减：连接、结晶、I 候选及碰撞材料一律不读取其正文
+- I 候选不受普通近期窗口限制；否则候选一旦老于 window_hours，就再也无法
+  获得三次跨日见证。仍排除 pinned / resolved / protected
 - 任意异常都吞掉，只 warning，不影响 dream 主流程
 - 只读已落盘向量，不发新的 embedding 请求
 
@@ -25,16 +27,27 @@ tools/dream/hints.py — dream 的连接提示、结晶提示与 I 候选碰撞�
 - 不替模型决定，只给「不替你下结论」的提示
 
 对外暴露：build_connection_hint(recent) / build_crystal_hint(all_buckets)
-         / collect_self_candidates(all_buckets)
+         / collect_self_candidates(all_buckets, window_hours)
 ========================================
 """
 
 from dataclasses import dataclass, field
 
-from ..i import I_PROMOTE_THRESHOLD, is_pending_candidate
+from ..i import I_PROMOTE_THRESHOLD, dream_dates, is_pending_candidate
 from .. import _runtime as rt
 from ..plan.core import is_letter_bucket
 from utils import parse_bool, strip_wikilinks
+
+# 结晶提示低频触发：不是随便 2 条相似就提示，要凑够一簇 5 条（自己 + 4 条
+# 相似 feel）才值得打断一次；避免同一批 feel 每场梦都刷同样的提示。
+_CRYSTAL_CLUSTER_MIN = 5
+
+# 每场梦最多给几条候选完整的碰撞材料。
+#
+# 不设上限时，一次梦要为所有未 promote 的候选各取一轮 embedding 并渲染整块；
+# 候选只增不减的话，这一段会无限膨胀，而预算是先到先得的——最后谁都拿不到。
+# 有了上限 + 「缺得最多的先来」的排序，名额才会在候选之间轮转。
+_MAX_SELF_CANDIDATES_PER_DREAM = 5
 
 # 对照池上限：正式 I 条目和其它候选永远全量参与碰撞，普通记忆只取最近这么多条。
 # get_embedding 每条一次 sqlite 查询，全库几千条会让 dream 明显变慢，而更老的
@@ -92,7 +105,7 @@ async def build_crystal_hint(all_buckets: list) -> str:
                 (b.get("metadata") or {}).get("protected"), default=False
             )
         ]
-        if len(feels) < 3:
+        if len(feels) < _CRYSTAL_CLUSTER_MIN:
             return ""
         feel_embeddings: dict = {}
         for f in feels:
@@ -106,7 +119,7 @@ async def build_crystal_hint(all_buckets: list) -> str:
                     sim = rt.embedding_engine._cosine_similarity(femb, oemb)
                     if sim > 0.7:
                         similar_feels.append(oid)
-            if len(similar_feels) >= 2:
+            if len(similar_feels) >= _CRYSTAL_CLUSTER_MIN - 1:
                 feel_bucket = next((f for f in feels if f["id"] == fid), None)
                 if feel_bucket and not feel_bucket["metadata"].get("pinned"):
                     content_preview = strip_wikilinks(feel_bucket["content"][:80])
@@ -135,14 +148,28 @@ class SelfCandidate:
 class SelfReview:
     """dream 里的 I 候选段。
 
-    ``rendered_ids`` 由 output.py 在实际渲染出某条候选后回写，dream 的
-    dispatch 只给这些候选记「被见证过一次」——没被看见的不算经历过。
+    ``candidates`` 是**还缺见证**的候选，只有它们需要完整的碰撞材料。
+    ``ready`` 是见证已经攒够、只等模型去 promote 的，压成一行提醒就够——
+    再给它们完整块是纯浪费：一条 3/3 的候选再被见证一百次也不会有任何变化，
+    却会占着预算，把真正还缺见证的挤出去。
+
+    ``rendered_ids`` 由 output.py 回写真正出现在最终文本中的候选（近期正文、
+    候选主块或碰撞材料），dream 的 dispatch 只给它们记「被见证过一次」。
+    压成一行的 ``ready`` 不算见证——那不是「和材料摆在一起看过」。
+
+    ``pending_ids`` 是这场梦**考虑过**的全部待沉淀候选，不管有没有被渲染。
+    它和 ``rendered_ids`` 的差额就是「这场梦它在队列里，但没被看见」。两个数
+    分开记，才能回答「一条候选攒不到见证，是因为梦做得少，还是因为梦做了
+    但它从来没排到」——前者不是 bug，后者是。
     """
 
     candidates: list[SelfCandidate] = field(default_factory=list)
+    ready: list[SelfCandidate] = field(default_factory=list)
     vectors_available: bool = False
     threshold: int = I_PROMOTE_THRESHOLD
     rendered_ids: list[str] = field(default_factory=list)
+    starved: int = 0
+    pending_ids: list[str] = field(default_factory=list)
 
 
 def _timestamp_key(bucket: dict) -> str:
@@ -150,9 +177,12 @@ def _timestamp_key(bucket: dict) -> str:
     return str(meta.get("last_active") or meta.get("created") or "")
 
 
-async def collect_self_candidates(all_buckets: list) -> SelfReview:
+async def collect_self_candidates(all_buckets: list, window_hours: int) -> SelfReview:
     """收集待沉淀的 I 候选，并为每条取几条语义上最挨着的对照材料。
 
+    I 候选需要三次跨日见证才能升级，因此不能复用普通记忆的近期窗口；
+    否则过期候选会永久卡住。``window_hours`` 只约束普通 dream 记忆，保留
+    在参数中是为了维持调用契约。候选仍排除 pinned / resolved / protected。
     材料只是材料：支持、反驳、撞车都可能，这里不做任何判定。
     """
     pending = [
@@ -161,24 +191,60 @@ async def collect_self_candidates(all_buckets: list) -> SelfReview:
         and not parse_bool(
             (b.get("metadata") or {}).get("protected"), default=False
         )
+        and not (b.get("metadata") or {}).get("pinned", False)
+        and not (b.get("metadata") or {}).get("resolved", False)
     ]
     if not pending:
         return SelfReview()
 
-    pending.sort(key=lambda b: str((b.get("metadata") or {}).get("created") or ""))
+    # 在 `pending` 被下面的取舍改写之前先留一份全量 id：谁被展开是这场梦的
+    # 结果，谁在队列里是这场梦的事实，后者才是「它到底等了几场梦」的分母。
+    all_pending_ids = [
+        str(b.get("id") or "").strip() for b in pending if str(b.get("id") or "").strip()
+    ]
+
+    # 按「还差几次见证」排，不按 created。
+    #
+    # 原先是 created 升序（最旧在前）+ 无上限，而 output.py 逐条撞预算、撞满即丢
+    # 且不计见证。两件事合起来就是队首阻塞：最旧的永远排在前面吃预算，新写的候选
+    # 排在队尾，拿不到见证 → 永远转不了正 → 永远留在队列里继续挡着后面的。
+    #
+    # 攒够的（passes >= threshold）单独拆出去：它们只等模型去 promote，再给完整
+    # 碰撞材料是纯浪费，一行提醒就够。
+    threshold = I_PROMOTE_THRESHOLD
+    growing: list[dict] = []
+    ready: list[dict] = []
+    for bucket in pending:
+        if len(dream_dates(bucket.get("metadata") or {})) >= threshold:
+            ready.append(bucket)
+        else:
+            growing.append(bucket)
+
+    def _need_key(bucket: dict) -> tuple:
+        meta = bucket.get("metadata") or {}
+        dates = dream_dates(meta)
+        # 缺得最多的排最前；同样缺的，最久没被见证的先来——保证轮转，
+        # 不让固定几条把每场梦的名额包了。
+        return (len(dates), dates[-1] if dates else "", str(meta.get("created") or ""))
+
+    growing.sort(key=_need_key)
+    starved = max(0, len(growing) - _MAX_SELF_CANDIDATES_PER_DREAM)
+    growing = growing[:_MAX_SELF_CANDIDATES_PER_DREAM]
+    ready.sort(key=lambda b: str((b.get("metadata") or {}).get("created") or ""))
+
     review = SelfReview(
         candidates=[
-            SelfCandidate(
-                bucket=b,
-                passes=[
-                    str(d)[:10]
-                    for d in ((b.get("metadata") or {}).get("i_dream_dates") or [])
-                    if str(d).strip()
-                ],
-            )
-            for b in pending
-        ]
+            SelfCandidate(bucket=b, passes=dream_dates(b.get("metadata") or {}))
+            for b in growing
+        ],
+        ready=[
+            SelfCandidate(bucket=b, passes=dream_dates(b.get("metadata") or {}))
+            for b in ready
+        ],
+        starved=starved,
+        pending_ids=all_pending_ids,
     )
+    pending = growing
 
     if not (rt.embedding_engine and rt.embedding_engine.enabled):
         return review
@@ -192,6 +258,7 @@ async def collect_self_candidates(all_buckets: list) -> SelfReview:
             if b["id"] not in pending_ids
             and not is_letter_bucket(b)
             and (b.get("metadata") or {}).get("type") == "i"
+            and not (b.get("metadata") or {}).get("pinned", False)
             and not parse_bool(
                 (b.get("metadata") or {}).get("protected"), default=False
             )
@@ -201,6 +268,7 @@ async def collect_self_candidates(all_buckets: list) -> SelfReview:
             if b["id"] not in pending_ids
             and not is_letter_bucket(b)
             and (b.get("metadata") or {}).get("type") not in ("i", "letter")
+            and not (b.get("metadata") or {}).get("pinned", False)
             and not parse_bool(
                 (b.get("metadata") or {}).get("protected"), default=False
             )

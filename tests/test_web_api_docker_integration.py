@@ -5,11 +5,17 @@ password setup in an isolated Docker volume. It never targets a user vault.
 """
 
 import os
-import json
+import re
 from urllib.parse import urlsplit
 
 import httpx
 import pytest
+
+
+def _bucket_id(text: str) -> str:
+    match = re.search(r"(?<![0-9a-f])[0-9a-f]{12}(?![0-9a-f])", text)
+    assert match, text
+    return match.group(0)
 
 
 def _configured_base_url() -> str:
@@ -169,17 +175,20 @@ def test_desktop_management_api_first_run_and_authenticated_flow():
 
         request_id = 0
 
-        def mcp_request(method, params=None):
+        def mcp_request(method, params=None, path="/mcp"):
             nonlocal request_id
             request_id += 1
             response = client.post(
-                "/mcp",
+                path,
                 headers={"Accept": "application/json", "Content-Type": "application/json"},
                 json={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}},
             )
             assert response.status_code == 200, response.text
             return response.json()
 
+        # 信件 3.2.0 拆到 /mcp-extra、3.4.0 并回 /mcp。这条用例验证的是
+        # "AI 通过 MCP 读信时看不到人类的私密信件"——两次搬家边界都没变，
+        # 变的只是端点。
         mcp_request("initialize", {
             "protocolVersion": "2025-03-26",
             "capabilities": {},
@@ -206,19 +215,20 @@ def test_desktop_management_api_first_run_and_authenticated_flow():
             },
         })
         ai_receipt_text = ai_write["result"]["content"][0]["text"]
-        ai_receipt = json.loads(ai_receipt_text)
+        ai_letter_id = _bucket_id(ai_receipt_text)
+        assert "🔒permanent" in ai_receipt_text
         assert ai_secret not in ai_receipt_text and ai_title not in ai_receipt_text
 
         dashboard_letters = client.get("/api/letters").json()["letters"]
-        ai_item = next(item for item in dashboard_letters if item["id"] == ai_receipt["letter_id"])
+        ai_item = next(item for item in dashboard_letters if item["id"] == ai_letter_id)
         assert ai_item["locked"] is True
         assert ai_item["writer_name"] == "张三"
         assert "content" not in ai_item and "title" not in ai_item
         assert client.patch(
-            f"/api/letter/{ai_receipt['letter_id']}", json={"lock_type": "none"}
+            f"/api/letter/{ai_letter_id}", json={"lock_type": "none"}
         ).status_code == 403
         assert client.patch(
-            f"/api/letter/{ai_receipt['letter_id']}", json={"content": "must-not-apply"}
+            f"/api/letter/{ai_letter_id}", json={"content": "must-not-apply"}
         ).status_code == 403
 
         # A newer ordinary Letter must not suppress the independent notice for
@@ -290,7 +300,12 @@ def test_desktop_management_api_first_run_and_authenticated_flow():
 
         assert client.get("/.well-known/oauth-protected-resource/mcp").status_code == 404
         assert client.get("/.well-known/oauth-protected-resource/not-a-route").status_code == 404
+        # /mcp-extra 自 3.4.0 随信件并回主链路而再次退役：这条路不存在了，
+        # 要的就是 404。3.2.0–3.3.0 期间它是信件连接器，那时 GET 拿的是 406
+        # （streamable-http 只接受 POST + JSON Accept）。
         assert client.get("/mcp-extra").status_code == 404
+        # 主连接器仍在，GET 拿 406 而不是 404
+        assert client.get("/mcp").status_code == 406
 
         invalid_transport = client.post(
             "/api/transport",

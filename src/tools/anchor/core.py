@@ -26,23 +26,33 @@ pulse 顺带放在这里：它是系统状态 + 桶清单的总览，调用频�
 ========================================
 """
 
+from errors import ToolInputError
 from typing import Optional
 
 from .. import _runtime as rt
 from .._common import check_metadata_size
 from ..plan.core import is_letter_bucket, letter_lock_state
+from utils import parse_bool
+from errors import safe_error_detail
 
 
 async def anchor_set(bucket_id: str) -> str:
+    # 24 这个数字没什么道理，就是觉得再多就不叫锚了。
+    # 人能同时抓住的东西本来也没那么多。
     bucket_id = "" if bucket_id is None else str(bucket_id)
     metadata_err = check_metadata_size(bucket_id=bucket_id)
     if metadata_err:
-        return metadata_err
+        raise ToolInputError(metadata_err)
     if rt.mark_op:
         rt.mark_op("anchor")
     result = await rt.bucket_mgr.set_anchor(bucket_id, True)
     if not result["ok"]:
-        return f"我没能把它锚住。{result.get('error', '未知错误')} 当前 anchor: {result.get('count', '?')}/{result.get('limit', 24)}。"
+        # ok=False 与下面的 noop=True 是两个不同分支，不能混为一谈：
+        # 这里是桶不存在或配额满，anchor 一个都没加上；noop 才是幂等。
+        raise ToolInputError(
+            f"我没能把它锚住：{result.get('error', '未知错误')}。"
+            f"当前 anchor: {result.get('count', '?')}/{result.get('limit', 24)}。"
+        )
     if result.get("noop"):
         return f"它已经是 anchor 了。当前 {result['count']}/{result['limit']}。"
     return f"我把它放进 anchor 了。它现在是坐标系的一部分，不会被默认浮现挤进上下文。当前 {result['count']}/{result['limit']}。"
@@ -52,12 +62,12 @@ async def anchor_release(bucket_id: str) -> str:
     bucket_id = "" if bucket_id is None else str(bucket_id)
     metadata_err = check_metadata_size(bucket_id=bucket_id)
     if metadata_err:
-        return metadata_err
+        raise ToolInputError(metadata_err)
     if rt.mark_op:
         rt.mark_op("release")
     result = await rt.bucket_mgr.set_anchor(bucket_id, False)
     if not result["ok"]:
-        return f"释放失败。{result.get('error', '未知错误')}"
+        raise ToolInputError(f"我没能把它移开：{result.get('error', '未知错误')}。")
     if result.get("noop"):
         return f"它本来就不是 anchor。当前 {result['count']}/{result['limit']}。"
     return f"我把它从 anchor 移开了。它会重新参与默认浮现。当前 {result['count']}/{result['limit']}。"
@@ -70,7 +80,7 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
     try:
         stats = await rt.bucket_mgr.get_stats()
     except Exception as e:
-        return f"获取系统状态失败: {e}"
+        raise ToolInputError(f"获取系统状态失败: {safe_error_detail(e)}")
 
     status = (
         f"=== 我现在的记忆 ===\n"
@@ -177,8 +187,13 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
             if letter_locked else meta.get("name", "") or ""
         )
         name_tag = f" 《{name}》" if name and name != b["id"] else ""
+        anchor_tag = (
+            " ⚓ [anchor]"
+            if parse_bool(meta.get("anchor"), default=False)
+            else ""
+        )
         line = (
-            f"{icon} [{b['id']}]{name_tag}{resolved_tag} "
+            f"{icon} [{b['id']}]{anchor_tag}{name_tag}{resolved_tag} "
             f"主题:{domains or '未分类'} "
             f"情感:V{val:.1f}/A{aro:.1f} "
             f"重要:{meta.get('importance', '?')} "

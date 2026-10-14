@@ -76,7 +76,13 @@
 - `OMBRE_MING_VAULT_DIR`、`OMBRE_HONG_VAULT_DIR`：示例多所有者数据目录。
 - `OMBRE_MING_PASSWORD`、`OMBRE_HONG_PASSWORD`：示例多所有者密码。
 - `OMBRE_MING_MCP_TOKEN`、`OMBRE_HONG_MCP_TOKEN`：多所有者 Compose 中每个实例各自的静态 MCP Token；不要让多个 owner 共用同一密钥。
-- `AI_NAME`：AI 显示名称。
+- `AI_NAME`：AI 显示名称（letter 署名、prompt、面向用户的文案）。
+  **优先级：`config.yaml` 的 `ai_name` → 本变量 → 回退 `"AI"`。**
+  自 3.0.0 起首选写进 `config.yaml`：它随 vault 一起持久化，Docker 下容器
+  重建/重启都不会丢；本变量则依赖 compose 逐个透传。`config.yaml` 里默认留空，
+  表示「没配」，此时行为与旧版一致。
+  > 3.0.0 之前 `deploy/docker-compose.yml` 并未透传本变量，导致 Docker 用户
+  > 实际设不上 AI 显示名，带锁 Letter 因取不到实际关系名而无法创建；现已补上透传。
 
 ## v1.x 兼容变量
 

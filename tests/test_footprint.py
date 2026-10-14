@@ -3,6 +3,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from errors import ToolInputError
+
 import tools._runtime as rt
 from ombrebrain.eventsourcing.footprint import FootprintSnapshot
 from tools._common import count_pinned
@@ -105,8 +107,9 @@ async def test_trace_restore_is_explicit_and_reindexes_bucket(bucket_mgr, decay_
     assert await bucket_mgr.delete(bucket_id) is True
     _install_runtime(bucket_mgr, decay_eng)
 
-    conflict = await trace_core(bucket_id, restore=True, content="do not overwrite")
-    assert "restore=True 必须单独调用" in conflict
+    with pytest.raises(ToolInputError) as excinfo:
+        await trace_core(bucket_id, restore=True, content="do not overwrite")
+    assert 'restore=True 必须单独调用' in str(excinfo.value)
     assert await bucket_mgr.get(bucket_id) is None
 
     restored = await trace_core(bucket_id, restore=True)

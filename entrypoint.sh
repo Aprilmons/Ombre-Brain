@@ -1,8 +1,8 @@
 #!/bin/sh
 # entrypoint.sh — 容器启动入口
 #
-# 职责：确保 config 文件是一个可用的**普通文件**再启动服务，否则宁可 FATAL 退出，
-# 也不让应用带着坏配置进入无限崩溃重启。不做其他事（不改业务逻辑）。
+# 职责：先保存并核验升级前完整数据，再准备配置和持久化代码。
+# 任一升级保护检查失败立即 FATAL 退出，不让应用改写尚未保护的数据。
 #
 # 问题背景（Windows/WSL2 fresh install 崩溃重启）：
 #   旧 compose 用单文件 bind mount `./config.yaml:/app/config.yaml`。若宿主
@@ -23,6 +23,18 @@
 IMAGE_ROOT="${OMBRE_IMAGE_ROOT:-/app}"
 CONFIG="${OMBRE_CONFIG_PATH:-$IMAGE_ROOT/config.yaml}"
 DEFAULT="$IMAGE_ROOT/config.default.yaml"
+
+# 大版本升级会改写向量数据库格式，必须先于任何配置初始化或代码播种。
+# 镜像缺少保护脚本也不能跳过检查；此处不导入任何应用模块。
+UPGRADE_GUARD="$IMAGE_ROOT/deploy/clockworkkoi_upgrade_guard.py"
+if [ ! -f "$UPGRADE_GUARD" ]; then
+    echo "[entrypoint] FATAL: 缺少升级数据保护脚本，已阻止启动。"
+    exit 1
+fi
+if ! python "$UPGRADE_GUARD" backup --offline --target-version 3.6.15; then
+    echo "[entrypoint] FATAL: 升级前数据保护未通过；配置、活动代码及数据库尚未由本入口改写。"
+    exit 1
+fi
 
 mkdir -p "$(dirname "$CONFIG")" 2>/dev/null || true
 
@@ -67,8 +79,8 @@ echo "[entrypoint] config ready at '$CONFIG'."
 # 方案：把 src/frontend 播种到数据卷上的 CODE_DIR，从那里运行；repo_root 随之
 # 指向 CODE_DIR，热更新直接写持久盘，容器重建也还在。
 #   · 镜像版本变化(正经重建) → 重新播种，让重建覆盖旧热更新。
-#   · 连续启动失败 → 回滚到 _prev（do-update 覆盖前留的上一版），防坏更新锁死。
-#   · 任何环节失败 → 回退到镜像内置 /app/src，绝不 brick。
+#   · 连续启动失败 → 仅同大版本才回滚到 _prev；跨版本必须连同数据恢复。
+#   · 普通播种失败 → 回退到镜像内置 /app/src；数据保护阻断则立即退出。
 # 裸机(非 Docker)不走本脚本，直接从仓库目录跑，本就是持久的。
 # ============================================================
 CODE_DIR="${OMBRE_CODE_DIR:-$(dirname "$CONFIG")/_app}"
@@ -81,6 +93,23 @@ _code_fingerprint() {
     python "$FINGERPRINT_TOOL" "$1" 2>/dev/null
 }
 
+_code_major() {
+    # 两处版本同时存在时必须一致；缺失、未知或异常格式都不能证明回滚安全。
+    root_version="$(cat "$1/VERSION" 2>/dev/null || true)"
+    source_version="$(cat "$1/src/VERSION" 2>/dev/null || true)"
+    if [ -n "$root_version" ] && [ -n "$source_version" ] && [ "$root_version" != "$source_version" ]; then
+        return 1
+    fi
+    version="${root_version:-$source_version}"
+    case "$version" in ''|*[!0-9.]*|.*|*..*|*.) return 1 ;; esac
+    major="${version%%.*}"
+    remainder="${version#*.}"
+    patch="${remainder#*.}"
+    [ "$remainder" != "$version" ] && [ "$patch" != "$remainder" ] || return 1
+    case "$patch" in *.*) return 1 ;; esac
+    printf '%s\n' "$major"
+}
+
 _write_marker() {
     marker="$1"
     value="$2"
@@ -89,11 +118,25 @@ _write_marker() {
     mv -f "$marker_tmp" "$marker" 2>/dev/null
 }
 
+# 随镜像播种到运行时目录的可选顶层目录。src / frontend 是必需的（缺了跑不起来，
+# 单独处理），这里只列「有就播种、没有也不影响启动」的：
+#   docs/   —— adr_requirements 诊断在运行时目录下读 docs/adr/
+#   tools/  —— preflight_cli_diagnostics 诊断要求 tools/vnext_preflight.py
+#   kernel/ —— vnext_preflight 的 rust_kernel_scaffold 契约检查对象
+# 此前不播种它们，这三项诊断在任何 Docker 部署上都恒红。老镜像没有这些目录，
+# 因此一律「存在才处理」，绝不能让缺失阻断启动或回滚。
+SEED_DIRS_OPTIONAL="docs tools kernel"
+
 _restore_seed_swap() {
     old_dir="$1"
     rm -rf "$CODE_DIR/src" "$CODE_DIR/frontend" 2>/dev/null || true
     [ ! -d "$old_dir/src" ] || mv "$old_dir/src" "$CODE_DIR/src" 2>/dev/null || true
     [ ! -d "$old_dir/frontend" ] || mv "$old_dir/frontend" "$CODE_DIR/frontend" 2>/dev/null || true
+    # 可选目录：回滚到旧状态——旧状态没有就该删掉新播种进来的，不做恢复。
+    for seed_dir in $SEED_DIRS_OPTIONAL; do
+        rm -rf "$CODE_DIR/$seed_dir" 2>/dev/null || true
+        [ ! -d "$old_dir/$seed_dir" ] || mv "$old_dir/$seed_dir" "$CODE_DIR/$seed_dir" 2>/dev/null || true
+    done
     for root_file in VERSION requirements.txt requirements.lock.txt; do
         rm -f "$CODE_DIR/$root_file" 2>/dev/null || true
         [ ! -f "$old_dir/$root_file" ] || cp -a "$old_dir/$root_file" "$CODE_DIR/$root_file" 2>/dev/null || true
@@ -108,6 +151,13 @@ _seed_image_code() {
     mkdir -p "$stage" "$old_dir" 2>/dev/null || return 1
     cp -a "$IMAGE_ROOT/src" "$stage/src" 2>/dev/null || { rm -rf "$stage" "$old_dir"; return 1; }
     cp -a "$IMAGE_ROOT/frontend" "$stage/frontend" 2>/dev/null || { rm -rf "$stage" "$old_dir"; return 1; }
+    # 可选目录：镜像里有才复制；复制失败说明镜像损坏，按整体失败处理。
+    for seed_dir in $SEED_DIRS_OPTIONAL; do
+        [ ! -d "$IMAGE_ROOT/$seed_dir" ] || cp -a "$IMAGE_ROOT/$seed_dir" "$stage/$seed_dir" 2>/dev/null || {
+            rm -rf "$stage" "$old_dir"
+            return 1
+        }
+    done
     for root_file in VERSION requirements.txt requirements.lock.txt; do
         [ ! -f "$IMAGE_ROOT/$root_file" ] || cp -a "$IMAGE_ROOT/$root_file" "$stage/$root_file" 2>/dev/null || {
             rm -rf "$stage" "$old_dir"
@@ -131,6 +181,14 @@ _seed_image_code() {
             return 1
         }
     fi
+    # 到这里 src（可能还有 frontend）已经移进 old_dir，回滚要走 _restore_seed_swap。
+    for seed_dir in $SEED_DIRS_OPTIONAL; do
+        [ ! -d "$CODE_DIR/$seed_dir" ] || mv "$CODE_DIR/$seed_dir" "$old_dir/$seed_dir" 2>/dev/null || {
+            _restore_seed_swap "$old_dir"
+            rm -rf "$stage" "$old_dir" 2>/dev/null
+            return 1
+        }
+    done
     for root_file in VERSION requirements.txt requirements.lock.txt; do
         [ ! -f "$CODE_DIR/$root_file" ] || cp -a "$CODE_DIR/$root_file" "$old_dir/$root_file" 2>/dev/null || true
     done
@@ -145,6 +203,13 @@ _seed_image_code() {
         rm -rf "$stage" "$old_dir" 2>/dev/null
         return 1
     }
+    for seed_dir in $SEED_DIRS_OPTIONAL; do
+        [ ! -d "$stage/$seed_dir" ] || mv "$stage/$seed_dir" "$CODE_DIR/$seed_dir" 2>/dev/null || {
+            _restore_seed_swap "$old_dir"
+            rm -rf "$stage" "$old_dir" 2>/dev/null
+            return 1
+        }
+    done
     for root_file in VERSION requirements.txt requirements.lock.txt; do
         rm -f "$CODE_DIR/$root_file" 2>/dev/null || true
         [ ! -f "$stage/$root_file" ] || cp -a "$stage/$root_file" "$CODE_DIR/$root_file" 2>/dev/null || {
@@ -195,10 +260,24 @@ _bootstrap_code() {
     FAILS="$(cat "$CODE_DIR/.boot_fails" 2>/dev/null || echo 0)"
     case "$FAILS" in ''|*[!0-9]*) FAILS=0 ;; esac
     if [ "$FAILS" -ge "$ROLLBACK_THRESHOLD" ] && [ -f "$CODE_DIR/_prev/src/server.py" ]; then
+        IMAGE_MAJOR="$(_code_major "$IMAGE_ROOT" 2>/dev/null || true)"
+        ACTIVE_MAJOR="$(_code_major "$CODE_DIR" 2>/dev/null || true)"
+        PREVIOUS_MAJOR="$(_code_major "$CODE_DIR/_prev" 2>/dev/null || true)"
+        if [ -z "$IMAGE_MAJOR" ] || [ -z "$ACTIVE_MAJOR" ] || [ -z "$PREVIOUS_MAJOR" ] || \
+           [ "$PREVIOUS_MAJOR" != "$IMAGE_MAJOR" ] || [ "$PREVIOUS_MAJOR" != "$ACTIVE_MAJOR" ]; then
+            echo "[entrypoint] FATAL code-state=rollback-blocked: _prev 与当前代码跨大版本或版本无法确认，禁止仅回滚代码。"
+            echo "[entrypoint] 当前代码、_prev 与数据均已保留；请停服后按升级快照成套恢复数据和匹配版本的代码。"
+            return 2
+        fi
         echo "[entrypoint] 连续 $FAILS 次启动失败 → 回滚到上一版代码 (_prev)"
         rm -rf "$CODE_DIR/src" "$CODE_DIR/frontend" 2>/dev/null
         cp -a "$CODE_DIR/_prev/src" "$CODE_DIR/src" 2>/dev/null || return 1
         cp -a "$CODE_DIR/_prev/frontend" "$CODE_DIR/frontend" 2>/dev/null || true
+        # 可选目录：回滚点没有就该删掉，让运行时树与 _prev 完全一致。
+        for seed_dir in $SEED_DIRS_OPTIONAL; do
+            rm -rf "$CODE_DIR/$seed_dir" 2>/dev/null || true
+            [ ! -d "$CODE_DIR/_prev/$seed_dir" ] || cp -a "$CODE_DIR/_prev/$seed_dir" "$CODE_DIR/$seed_dir" 2>/dev/null || true
+        done
         for root_file in VERSION requirements.txt requirements.lock.txt; do
             rm -f "$CODE_DIR/$root_file" 2>/dev/null || true
             [ ! -f "$CODE_DIR/_prev/$root_file" ] || cp -a "$CODE_DIR/_prev/$root_file" "$CODE_DIR/$root_file" 2>/dev/null || return 1
@@ -239,7 +318,14 @@ _bootstrap_code() {
     fi
 
     if [ -n "$RESEED_REASON" ]; then
-        echo "[entrypoint] code-state=reseed reason=$RESEED_CODE: 播种代码到持久卷 $CODE_DIR：$RESEED_REASON"
+        # ${CODE_DIR} 的花括号不能省：后面紧跟的全角「：」是多字节字符，
+        # shell 会把它的首字节当成变量名的一部分去展开一个不存在的变量，
+        # 结果是路径整个丢失、并向 stdout 吐出半个字符（非法 UTF-8）。
+        # ${CODE_DIR} 的花括号一个都不能省。这里原本写的 $CODE_DIR：，
+        # 全角冒号的第一个字节被当成变量名的一部分吃掉了，路径没了，
+        # 还顺手吐出一串非法 UTF-8。四个测试为此红了不知道多久，
+        # 谁看日志都觉得是路径配错了。是个冒号。
+        echo "[entrypoint] code-state=reseed reason=$RESEED_CODE: 播种代码到持久卷 ${CODE_DIR}：$RESEED_REASON"
         _seed_image_code || return 1
         _write_marker "$CODE_DIR/.seeded_image_version" "$IMG_VER" || return 1
         [ -z "$IMG_FP" ] || _write_marker "$CODE_DIR/.seeded_image_fingerprint" "$IMG_FP" || return 1
@@ -268,6 +354,11 @@ _bootstrap_code() {
 if _bootstrap_code; then
     echo "[entrypoint] 从持久卷运行: $RUN_ROOT/src/server.py"
 else
+    BOOTSTRAP_STATUS=$?
+    if [ "$BOOTSTRAP_STATUS" -eq 2 ]; then
+        # 安全阻断不能被普通播种失败的镜像 fallback 吞掉。
+        exit 1
+    fi
     echo "[entrypoint] 持久卷代码不可用，回退到镜像内置代码 /app/src（不影响本次运行）"
     RUN_ROOT="$IMAGE_ROOT"
 fi

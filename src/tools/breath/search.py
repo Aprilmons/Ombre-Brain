@@ -11,7 +11,9 @@ tools/breath/search.py — 有 query 的检索模式
 - embedding 未配置/未启用/调用失败时明确提示并继续关键词/BM25 检索
 - 向量通道阈值 sim>=0.65；domain/tags/type 过滤与关键词通道完全一致
 - 命中正文不经过 LLM 摘要、改写或压缩，直接返回当前存储的 content
-- 命中后调 touch()，但不修改本次返回的正文或元数据
+- **3.6.0 起本分支完全只读**：命中不再 touch()。检索是「我去找它」，强化是
+  「找到之后，这条确实要紧」——绑在一起的话，查得勤就等于重要。要强化某条，
+  读完针对那一条 trace(bucket_id, reinforce=True)
 - 检索结果不足时，从低权重旧桶里随机漂出 3-5 条「忽然想起来」
 - 命中 0 条时回 webhook 报空，并给出可操作的引导文案
 
@@ -26,16 +28,21 @@ tools/breath/search.py — 有 query 的检索模式
 ========================================
 """
 
-import asyncio
+from errors import ToolInputError
 import hashlib
+import json
 import random
-from datetime import datetime, time
+from datetime import datetime
 
 from ombrebrain.policy.surfacing import SurfacePolicyVM
 from .. import _runtime as rt
 from ..plan.core import is_letter_bucket
+from ombrebrain.storage.attribution import names_from_config
+from ombrebrain.storage.quote_store import quotes_from_metadata, render_quotes
+from ._date_range import bucket_in_created_range, parse_created_range
+from ._shared import bucket_has_tags, footprint_reader
 from ._verbatim import render_stored_bucket
-from utils import parse_bool, parse_iso_datetime
+from utils import count_tokens_approx, parse_bool
 
 _SURFACE_POLICY = SurfacePolicyVM.default()
 
@@ -45,15 +52,55 @@ _SEMANTIC_DISABLED_NOTE = "[检索降级：语义索引暂不可用，本次仅�
 _BUDGET_NOTICE = "[token 预算不足：命中的下一条记忆未被截断或摘要，请提高 max_tokens 后重试。]"
 
 
-def _bucket_has_tags(meta: dict, tag_filter: list) -> bool:
-    if not tag_filter:
-        return True
-    bucket_tags = set(meta.get("tags", []) or [])
-    return all(t in bucket_tags for t in tag_filter)
+def _can_surface_search(bucket: dict, mode: str = "search") -> bool:
+    return _SURFACE_POLICY.evaluate_bucket(bucket, mode=mode).allowed
 
 
-def _can_surface_search(bucket: dict) -> bool:
-    return _SURFACE_POLICY.evaluate_bucket(bucket, mode="search").allowed
+# 给机器读的那一段的定界符。**这是一个契约，不是渲染的一部分。**
+#
+# 调用方原先只能去解析 `[bucket_id:...]` 这类人类渲染里的标记，渲染一改就静默
+# 失效，而失效方向是「该藏的漏出来」。这个块换掉那条路：标记稳定、带 schema
+# 版本号、由用例钉住；改它必须先让测试变红。
+#
+# 默认不出现（with_ids=False），所以既有调用方的输出一个字都不变。
+_ID_BLOCK_MARK = "=== ombre:result-ids ==="
+_ID_BLOCK_SCHEMA = 1
+
+
+def _append_id_block(
+    text: str,
+    bucket_ids: list[str],
+    call_mode: str,
+    omitted_by_policy: int,
+    with_ids: bool,
+) -> str:
+    """把机器可读的结果清单追加到渲染文本之后。"""
+    if not with_ids:
+        return text
+    payload = json.dumps(
+        {
+            "schema": _ID_BLOCK_SCHEMA,
+            "mode": "automatic" if call_mode == "automatic" else "manual",
+            "bucket_ids": [bid for bid in bucket_ids if bid],
+            "count": len([bid for bid in bucket_ids if bid]),
+            # 被 dont_surface / digested 挡掉的条数。给它是为了让「过滤有没有
+            # 真的生效」可观测——静默为 0 和静默漏出来在调用方眼里长得一样。
+            "omitted_by_policy": omitted_by_policy,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return f"{text}\n\n{_ID_BLOCK_MARK}\n```json\n{payload}\n```"
+
+
+def normalize_call_mode(mode: object) -> str:
+    """把调用方给的意图归一成 policy 认得的模式名。
+
+    只认 manual / automatic 两个值，其余（含空、拼错）一律当 manual——
+    默认必须是「今天的行为」，一个拼错的意图不该悄悄放宽或收紧过滤。
+    """
+    value = str(mode or "").strip().lower()
+    return "automatic" if value == "automatic" else "search"
 
 
 def _is_archived(bucket: dict) -> bool:
@@ -86,39 +133,6 @@ def _render_archived_hit(bucket: dict, footprint: str) -> tuple[str, int]:
     )
     from utils import count_tokens_approx
     return rendered, count_tokens_approx(rendered)
-
-
-def _parse_date_bound(value: str, *, upper: bool) -> datetime | None:
-    """解析创建时间边界；YYYY-MM-DD 的上界包含当天全日。"""
-    raw = value.strip()
-    if not raw:
-        return None
-    parsed = parse_iso_datetime(raw)
-    if len(raw) == 10:
-        day = parsed.date()
-        return datetime.combine(day, time.max if upper else time.min)
-    return parsed
-
-
-def _bucket_in_created_range(
-    bucket: dict,
-    created_from: datetime | None,
-    created_to: datetime | None,
-) -> bool:
-    if created_from is None and created_to is None:
-        return True
-    raw_created = str(bucket.get("metadata", {}).get("created") or "").strip()
-    if not raw_created:
-        return False
-    try:
-        created = parse_iso_datetime(raw_created)
-    except (TypeError, ValueError):
-        return False
-    if created_from is not None and created < created_from:
-        return False
-    if created_to is not None and created > created_to:
-        return False
-    return True
 
 
 async def _semantic_scores(query: str, top_k: int) -> tuple[dict[str, float], str]:
@@ -209,30 +223,23 @@ async def surface_search(
     tag_filter: list,
     date_from: str = "",
     date_to: str = "",
+    with_quotes: bool = False,
+    created_from: "datetime | None" = None,
+    created_to: "datetime | None" = None,
+    mode: str = "manual",
+    with_ids: bool = False,
 ) -> str:
+    call_mode = normalize_call_mode(mode)
+    omitted_by_policy = 0
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
-    try:
-        created_from = _parse_date_bound(date_from, upper=False)
-        created_to = _parse_date_bound(date_to, upper=True)
-    except (TypeError, ValueError):
-        return "日期格式无效，请使用 YYYY-MM-DD 或 ISO 8601 时间。"
-    if created_from and created_to and created_from > created_to:
-        return "date_from 不能晚于 date_to。"
+    # dispatch() 已经解析并校验过一次，直接用；单独调用本函数（测试、旧调用方）
+    # 时才现场解析。两条路解析的是同一个 _date_range。
+    if created_from is None and created_to is None:
+        created_from, created_to = parse_created_range(date_from, date_to)
 
-    try:
-        footprint_snapshot = rt.bucket_mgr.footprint_snapshot()
-    except Exception as exc:
-        rt.logger.warning(f"Footprint snapshot unavailable / 足迹读取失败: {exc}")
-        footprint_snapshot = None
-
-    def _footprint(bucket: dict) -> str:
-        if footprint_snapshot is None:
-            return "👣 Footprint：暂时无法读取"
-        return footprint_snapshot.summary(
-            str(bucket.get("id") or ""), bucket.get("metadata", {})
-        )
+    _footprint = footprint_reader()
 
     # A full bucket id is an address, not a semantic query.  Resolve it before
     # embedding/BM25 work so callers can reliably read the on-disk source text
@@ -255,19 +262,17 @@ async def surface_search(
         exact_bucket = None
     if exact_bucket:
         if is_letter_bucket(exact_bucket):
-            return "Letter 不通过普通 breath 检索返回；请使用 letter_read。"
+            raise ToolInputError("Letter 不通过普通 breath 检索返回；请使用 letter_read。")
         meta = exact_bucket.get("metadata", {}) or {}
         is_archived = _is_archived(exact_bucket)
         archived_original_kind = (
-            footprint_snapshot.original_kind(exact_id, meta)
-            if is_archived and footprint_snapshot is not None
-            else "dynamic"
+            _footprint.original_kind(exact_id, meta) if is_archived else "dynamic"
         )
         if (
             is_archived
             and archived_original_kind not in ("feel", "plan", "letter")
-            and _bucket_has_tags(meta, tag_filter)
-            and _bucket_in_created_range(exact_bucket, created_from, created_to)
+            and bucket_has_tags(meta, tag_filter)
+            and bucket_in_created_range(exact_bucket, created_from, created_to)
         ):
             rendered, entry_tokens = _render_archived_hit(
                 exact_bucket, _footprint(exact_bucket)
@@ -277,8 +282,8 @@ async def surface_search(
             not is_archived
             and meta.get("type") not in ("feel", "plan", "letter")
             and _can_surface_search(exact_bucket)
-            and _bucket_has_tags(meta, tag_filter)
-            and _bucket_in_created_range(exact_bucket, created_from, created_to)
+            and bucket_has_tags(meta, tag_filter)
+            and bucket_in_created_range(exact_bucket, created_from, created_to)
         ):
             protected_mark = (
                 "🛡️ [受保护记忆] "
@@ -293,9 +298,9 @@ async def surface_search(
             )
             if entry_tokens > max_tokens:
                 return _BUDGET_NOTICE
-            asyncio.create_task(
-                rt.bucket_mgr.touch_many([exact_bucket["id"]], ripple=False)
-            )
+            # 3.6.0：按完整 ID 取桶同样只读。这条路径存在的理由就是「改之前先读一眼
+            # 磁盘上的原文」（见上方注释），那是最不该被算作强化的一次读取——
+            # 越是要改它，越会先读它，读一次涨一次权重是纯粹的自我实现。
             if rt.fire_webhook:
                 await rt.fire_webhook(
                     "breath",
@@ -337,21 +342,27 @@ async def surface_search(
         if is_letter_bucket(bucket):
             continue
         if _is_archived(bucket):
-            original_kind = (
-                footprint_snapshot.original_kind(str(bucket.get("id") or ""), meta)
-                if footprint_snapshot is not None
-                else "dynamic"
+            original_kind = _footprint.original_kind(
+                str(bucket.get("id") or ""), meta
             )
             if original_kind in ("feel", "plan", "letter"):
                 continue
-        elif not _can_surface_search(bucket) or meta.get("type") in ("feel", "plan", "letter"):
+        elif meta.get("type") in ("feel", "plan", "letter"):
+            continue
+        elif not _can_surface_search(bucket, call_mode):
+            # 分开数：被「别主动拿给我」这类标记挡掉的条数要报给调用方。
+            # 调用方现在只能靠解析渲染文本自己剔，而那条路失效的方向是
+            # 「该藏的漏出来」——一个明确的计数能让静默失效变成可观测的。
+            decision = _SURFACE_POLICY.evaluate_bucket(bucket, mode=call_mode)
+            if {"dont_surface", "digested"} & set(decision.reasons):
+                omitted_by_policy += 1
             continue
         eligible_matches.append(bucket)
     matches = eligible_matches
-    matches = [b for b in matches if _bucket_has_tags(b["metadata"], tag_filter)]
+    matches = [b for b in matches if bucket_has_tags(b["metadata"], tag_filter)]
     matches = [
         b for b in matches
-        if _bucket_in_created_range(b, created_from, created_to)
+        if bucket_in_created_range(b, created_from, created_to)
     ]
     matches = matches[:max_results]
     rt.logger.info(
@@ -364,7 +375,6 @@ async def surface_search(
     results = []
     token_used = 0
     budget_blocked = False
-    touched_ids: list = []   # 性能 P2：浮现后统一在后台 touch，不在响应路径逐条 await
     for bucket in matches:
         meta = bucket["metadata"]
         bucket_id = bucket["id"]
@@ -390,18 +400,38 @@ async def surface_search(
             rendered, entry_tokens = render_stored_bucket(
                 bucket, header, _footprint(bucket)
             )
+        # 引语：唯一的出口就在这里。默认不附加——每一条浮现路径
+        # （breath / dream / catalog / feel）走的都是白名单渲染，读不到这个字段。
+        # 只有我在这次调用里明确说了「我想知道当时是怎么说的」，它才出现。
+        # 附加之后必须重算 token：预算是按实际返回的字数算的，不是按正文。
+        if with_quotes:
+            quote_block = render_quotes(
+                quotes_from_metadata(meta),
+                **names_from_config(getattr(rt, "config", None)),
+            )
+            if quote_block:
+                rendered = f"{rendered}\n{quote_block}"
+                entry_tokens = count_tokens_approx(rendered)
         if token_used + entry_tokens > max_tokens:
             budget_blocked = True
             break
         results.append(rendered)
         token_used += entry_tokens
-        if not _is_archived(bucket):
-            touched_ids.append(bucket_id)
 
-    # 性能 P2：把 touch 移出响应路径 —— 浮现完的桶在后台一次性更新激活，
-    # ripple=False 跳过读全库的时间涟漪。响应不再等这些写盘/涟漪。
-    if touched_ids:
-        asyncio.create_task(rt.bucket_mgr.touch_many(touched_ids, ripple=False))
+    # --- 3.6.0：检索不再强化。retrieval ≠ reinforcement ---
+    #
+    # 原来这里对**每一条命中**都 touch()：刷新 last_active、activation_count +1。
+    # 于是「被频繁查询」等价于「更重要」——我为了核对事实、debug、反复找同一件事
+    # 而读一条记忆，读着读着它的权重就爬到了最高。实测最高积到 51，新桶再也排不进
+    # 浮现区。这不是记忆在变重要，是我查得勤。
+    #
+    # 检索是「我去找它」，强化是「找到之后，这条确实要紧」。前者是我的动作，
+    # 后者是关于这条记忆的判断，只有读完才知道。把两者绑在一起，等于让读取行为
+    # 自己给自己投票。
+    #
+    # 所以这条路径现在是**只读的**，一条都不 touch。要强化某条，读完之后针对
+    # 那一条显式说：trace(bucket_id, reinforce=True)。是「那一条」而不是「这批
+    # 候选」——检索命中里绝大多数只是路过。
 
     # 检索命中不足时保留设计上的自由联想；用独立分区明确标记，
     # 避免调用方把随机旧桶误当成查询命中。
@@ -421,7 +451,7 @@ async def surface_search(
                     b["metadata"].get("protected"), default=False
                 )
                 and rt.decay_engine.calculate_score(b["metadata"]) < 2.0
-                and _bucket_in_created_range(b, created_from, created_to)
+                and bucket_in_created_range(b, created_from, created_to)
             ]
             remaining_slots = max(0, max_results - len(matches))
             if low_weight and remaining_slots:
@@ -448,14 +478,17 @@ async def surface_search(
 
     if not results:
         if budget_blocked:
-            return f"{semantic_notice}\n{_BUDGET_NOTICE}" if semantic_notice else _BUDGET_NOTICE
+            text = f"{semantic_notice}\n{_BUDGET_NOTICE}" if semantic_notice else _BUDGET_NOTICE
+            return _append_id_block(text, [], call_mode, omitted_by_policy, with_ids)
         if rt.fire_webhook:
             await rt.fire_webhook("breath", {"mode": "empty", "matches": 0})
         empty_text = (
             f"没有匹配到「{query}」相关的记忆。\n"
             "可以换个关键词试试，或用 breath() 看当下权重池；feel 用 breath_advanced(domain=\"feel\")，信件用 letter_read。"
         )
-        return f"{semantic_notice}\n{empty_text}" if semantic_notice else empty_text
+        if semantic_notice:
+            empty_text = f"{semantic_notice}\n{empty_text}"
+        return _append_id_block(empty_text, [], call_mode, omitted_by_policy, with_ids)
 
     final_text = "\n---\n".join(results)
     notices = []
@@ -467,4 +500,10 @@ async def surface_search(
         final_text = "\n".join(notices + [final_text])
     if rt.fire_webhook:
         await rt.fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
-    return final_text
+    return _append_id_block(
+        final_text,
+        [str(b.get("id") or "") for b in matches],
+        call_mode,
+        omitted_by_policy,
+        with_ids,
+    )

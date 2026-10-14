@@ -4,6 +4,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from errors import ToolInputError
+
 import tools._runtime as rt
 from tools.plan.core import (
     PERMANENT_UNLOCK_DATE,
@@ -44,6 +46,11 @@ def created_id(result):
     return result.split("→", 1)[1].split(" ", 1)[0]
 
 
+def assert_lock_update_succeeded(result, letter_id, lock_type):
+    assert letter_id in result
+    assert result.startswith("🔓" if lock_type == "none" else "🔒")
+
+
 @pytest.mark.asyncio
 async def test_old_and_none_letters_remain_readable_and_proxy_write_compatible(bucket_mgr):
     install_runtime(bucket_mgr)
@@ -73,8 +80,7 @@ async def test_mcp_creates_locked_letter_owned_by_ai_without_echoing_content(
         lock_type=lock_type,
         unlock_date=unlock if lock_type == "timed" else "",
     )
-    data = json.loads(result)
-    bucket = await bucket_mgr.get(data["letter_id"])
+    bucket = await bucket_mgr.get(created_id(result))
 
     assert "secret" not in result
     assert bucket["metadata"]["locked_by"] == "ai"
@@ -89,18 +95,21 @@ async def test_locked_proxy_write_is_rejected_but_does_not_echo_body(bucket_mgr,
     monkeypatch.setenv("AI_NAME", "张三")
     install_runtime(bucket_mgr)
     secret = "never echo this body"
-    result = await letter_write(author="user", content=secret, lock_type="permanent")
-    assert "不能替" in result
-    assert secret not in result
+    with pytest.raises(ToolInputError) as excinfo:
+        await letter_write(author="user", content=secret, lock_type="permanent")
+    assert '不能替' in str(excinfo.value)
+    # 拒绝的正文里一个字都不能带上信的内容——代存被拒时正文不该回显。
+    assert secret not in str(excinfo.value)
 
 
 @pytest.mark.asyncio
 async def test_generic_ai_name_rejects_only_locked_creation(bucket_mgr, monkeypatch):
     monkeypatch.delenv("AI_NAME", raising=False)
     install_runtime(bucket_mgr)
-    rejected = await letter_write(author="ai", content="locked", lock_type="permanent")
+    with pytest.raises(ToolInputError) as excinfo:
+        await letter_write(author="ai", content="locked", lock_type="permanent")
     normal = await letter_write(author="ai", content="ordinary", lock_type="none")
-    assert "实际关系名" in rejected
+    assert '实际关系名' in str(excinfo.value)
     assert created_id(normal)
 
 
@@ -134,10 +143,18 @@ async def test_lock_owner_can_change_every_supported_transition_without_editing_
     original = await bucket_mgr.get(letter_id)
     future = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
 
-    assert json.loads(await letter_lock_update(letter_id, "timed", future))["updated"] is True
-    assert json.loads(await letter_lock_update(letter_id, "permanent"))["updated"] is True
-    assert json.loads(await letter_lock_update(letter_id, "none"))["updated"] is True
-    assert json.loads(await letter_lock_update(letter_id, "timed", future))["updated"] is True
+    assert_lock_update_succeeded(
+        await letter_lock_update(letter_id, "timed", future), letter_id, "timed"
+    )
+    assert_lock_update_succeeded(
+        await letter_lock_update(letter_id, "permanent"), letter_id, "permanent"
+    )
+    assert_lock_update_succeeded(
+        await letter_lock_update(letter_id, "none"), letter_id, "none"
+    )
+    assert_lock_update_succeeded(
+        await letter_lock_update(letter_id, "timed", future), letter_id, "timed"
+    )
     current = await bucket_mgr.get(letter_id)
     assert current["content"] == original["content"]
     for field in ("title", "author", "created"):
@@ -156,17 +173,71 @@ async def test_non_owner_cannot_change_lock(bucket_mgr):
         unlock_date=PERMANENT_UNLOCK_DATE,
         locked_by="human",
     )
-    result = await letter_lock_update(letter_id, "none", caller_side="ai")
-    assert "只有" in result
+    with pytest.raises(ToolInputError) as excinfo:
+        await letter_lock_update(letter_id, "none", caller_side="ai")
+    assert '只有' in str(excinfo.value)
     assert (await bucket_mgr.get(letter_id))["metadata"]["lock_type"] == "permanent"
 
 
-def test_timed_validation_requires_future_timezone_and_permanent_is_canonical():
-    with pytest.raises(ValueError, match="timezone"):
-        normalize_unlock_date("timed", "2030-01-01T00:00:00")
-    with pytest.raises(ValueError, match="future"):
+def test_timed_validation_requires_future_and_permanent_is_canonical():
+    """必须是未来时间；permanent 归一到规范值。
+
+    「无时区一律拒绝」的旧行为已改：不写时区的时间按 config.yaml 的
+    `timezone`（默认 Asia/Shanghai）理解，见下面的时区用例。
+    """
+    with pytest.raises(ValueError, match="不在未来"):
         normalize_unlock_date("timed", "2020-01-01T00:00:00+08:00")
+    with pytest.raises(ValueError, match="不在未来"):
+        normalize_unlock_date("timed", "2020-01-01")
+    with pytest.raises(ValueError, match="看不懂"):
+        normalize_unlock_date("timed", "明年今天")
+    with pytest.raises(ValueError, match="定时锁需要"):
+        normalize_unlock_date("timed", "")
     assert normalize_unlock_date("permanent", "anything") == PERMANENT_UNLOCK_DATE
+
+
+def test_naive_unlock_date_uses_configured_timezone(monkeypatch, tmp_path):
+    """不写时区的时间按配置时区理解，而不是被拒绝、也不是按 UTC。
+
+    「2027-01-01 解锁」指的是本地那一天；按 UTC 理解会让东八区用户
+    实际在当地 08:00 才解锁，按机器本地时区又会随部署漂移。
+    """
+    import utils
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text('timezone: "Asia/Shanghai"\n', encoding="utf-8")
+    monkeypatch.setenv("OMBRE_CONFIG_PATH", str(cfg))
+    utils._timezone_cache = None
+
+    # 纯日期
+    assert normalize_unlock_date("timed", "2030-01-01").startswith("2030-01-01T00:00:00+08:00")
+    # 无时区的完整时刻
+    assert normalize_unlock_date("timed", "2030-01-01T09:30:00").startswith(
+        "2030-01-01T09:30:00+08:00"
+    )
+    # 显式时区优先于配置
+    assert normalize_unlock_date("timed", "2030-01-01T00:00:00+00:00").startswith(
+        "2030-01-01T00:00:00+00:00"
+    )
+
+    cfg.write_text('timezone: "UTC"\n', encoding="utf-8")
+    import os as _os
+
+    st = _os.stat(cfg)
+    _os.utime(cfg, (st.st_atime + 5, st.st_mtime + 5))
+    assert normalize_unlock_date("timed", "2030-01-01").startswith("2030-01-01T00:00:00+00:00")
+
+
+def test_invalid_timezone_falls_back_to_plus_eight(monkeypatch, tmp_path):
+    """时区名非法或环境缺 tzdata 时回退 +08:00，不能让解析日期这种小事抛异常。"""
+    import utils
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text('timezone: "Nowhere/Fake"\n', encoding="utf-8")
+    monkeypatch.setenv("OMBRE_CONFIG_PATH", str(cfg))
+    utils._timezone_cache = None
+
+    assert normalize_unlock_date("timed", "2030-01-01").startswith("2030-01-01T00:00:00+08:00")
 
 
 @pytest.mark.asyncio
@@ -429,8 +500,8 @@ async def test_ai_owner_can_relock_public_letter_through_multiple_cycles(
         ("timed", future),
     ]
     for lock_type, unlock_date in transitions:
-        result = json.loads(await letter_lock_update(letter_id, lock_type, unlock_date))
-        assert result["updated"] is True
+        result = await letter_lock_update(letter_id, lock_type, unlock_date)
+        assert_lock_update_succeeded(result, letter_id, lock_type)
         current = await bucket_mgr.get(letter_id)
         assert current["metadata"]["locked_by"] == "ai"
         assert current["metadata"]["writer_name"] == "张三"
@@ -461,8 +532,8 @@ async def test_expired_timed_letter_keeps_owner_and_can_be_locked_again(
     assert expired["metadata"]["writer_name"] == "张三"
 
     future = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
-    relocked = json.loads(await letter_lock_update(letter_id, "timed", future))
-    assert relocked["updated"] is True
+    relocked = await letter_lock_update(letter_id, "timed", future)
+    assert_lock_update_succeeded(relocked, letter_id, "timed")
     current = await bucket_mgr.get(letter_id)
     assert current["metadata"]["lock_type"] == "timed"
     assert current["metadata"]["locked_by"] == "ai"
@@ -483,8 +554,9 @@ async def test_other_side_cannot_relock_now_public_letter(bucket_mgr):
         locked_by="human",
     )
 
-    result = await letter_lock_update(letter_id, "permanent", caller_side="ai")
-    assert "只有" in result
+    with pytest.raises(ToolInputError) as excinfo:
+        await letter_lock_update(letter_id, "permanent", caller_side="ai")
+    assert '只有' in str(excinfo.value)
     current = await bucket_mgr.get(letter_id)
     assert current["metadata"]["lock_type"] == "none"
     assert current["metadata"]["locked_by"] == "human"
@@ -598,8 +670,8 @@ async def test_dashboard_converts_historical_letter_to_ai_owned_lockable_format(
     assert (await patch(JsonRequest({"lock_type": "permanent"}, historical_id))).status_code == 403
 
     install_runtime(bucket_mgr)
-    relocked = json.loads(await letter_lock_update(historical_id, "permanent"))
-    assert relocked["updated"] is True
+    relocked = await letter_lock_update(historical_id, "permanent")
+    assert_lock_update_succeeded(relocked, historical_id, "permanent")
     assert (await bucket_mgr.get(historical_id))["metadata"]["locked_by"] == "ai"
 
 
@@ -702,3 +774,64 @@ async def test_archived_letter_compat_restore_keeps_opposite_side_lock_hidden(
     assert restored["metadata"]["locked_by"] == "human"
     assert secret not in output
     assert "hidden title" not in output
+
+
+# ============================================================
+# 精确词组必须搜得到：向量结果不能覆盖字面命中
+#
+# letter_read 的向量通道不设相似度门槛，若「有向量结果就整体替换候选集」，
+# 搜一个确切词组时，真正含它的那封信会被一堆低相关结果挤出 top_k——
+# 信里明明写着却搜不到，而且只在启用向量时才犯病。
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_literal_match_survives_vector_ranking(bucket_mgr):
+    install_runtime(bucket_mgr)
+
+    target = await bucket_mgr.create(
+        content="这封信里有一个确切的词组：蓝鲸观测站。",
+        bucket_type="letter", domain=["letter"],
+    )
+    await bucket_mgr.update(target, author="user", writer_name="张三", lock_type="none")
+    noise = await bucket_mgr.create(
+        content="一封完全无关的信，只是恰好被向量排在了前面。",
+        bucket_type="letter", domain=["letter"],
+    )
+    await bucket_mgr.update(noise, author="user", writer_name="张三", lock_type="none")
+
+    class _NoiseFirstEngine:
+        """模拟无门槛向量检索：把无关信排在前面，且不返回目标信。"""
+        enabled = True
+
+        async def search_similar(self, query, top_k=10, allowed_bucket_ids=None):
+            return [(noise, 0.31)]
+
+    rt.embedding_engine = _NoiseFirstEngine()
+
+    out = await letter_read(query="蓝鲸观测站", author="user", limit=10)
+
+    assert "蓝鲸观测站" in out, "字面精确命中不能被向量结果挤掉"
+    assert out.index("蓝鲸观测站") < len(out), "精确命中应当出现在结果里"
+
+
+@pytest.mark.asyncio
+async def test_semantic_only_matches_still_returned(bucket_mgr):
+    """没有字面命中时，语义相似的结果仍要正常返回。"""
+    install_runtime(bucket_mgr)
+
+    semantic = await bucket_mgr.create(
+        content="今天心情很好，阳光不错。", bucket_type="letter", domain=["letter"],
+    )
+    await bucket_mgr.update(semantic, author="user", writer_name="张三", lock_type="none")
+
+    class _SemanticEngine:
+        enabled = True
+
+        async def search_similar(self, query, top_k=10, allowed_bucket_ids=None):
+            return [(semantic, 0.88)]
+
+    rt.embedding_engine = _SemanticEngine()
+
+    out = await letter_read(query="天气", author="user", limit=10)
+
+    assert "阳光不错" in out

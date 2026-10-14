@@ -1,5 +1,27 @@
 # Ombre Brain 可靠性与恢复手册
 
+## ClockworkKoi 2.16.10 → 3.6.15 定制升级
+
+3.6.15 基于上游 3.6.14。首次启动会把 SQLite 中旧 JSON 向量转换为 float32 BLOB；旧版 2.16.10 无法读取转换后的向量。**不能只回退 Git 提交、镜像或 `_prev` 代码。**
+
+本分支容器在配置初始化、代码播种与任何应用导入之前运行 `deploy/clockworkkoi_upgrade_guard.py backup --target-version 3.6.15 --offline`。平台必须先停止旧实例，再独占挂载数据卷；Railway 的单服务持久卷部署满足这一条件。其他部署者须自行停止所有共享该数据的写入进程。
+
+脚本读取现有 `OMBRE_BUCKETS_DIR`、`OMBRE_VAULT_DIR`、`OMBRE_CONFIG_PATH`、`OMBRE_CODE_DIR`、`OMBRE_IMAGE_ROOT`，完整保存去重后的持久路径，包括记忆、`_sources`、`_media`、SQLite 及其 WAL、配置、卷内授权状态与旧代码；平台环境变量中的凭据仍由平台保管。生产路径保持 `/app/buckets`、其内配置文件与活动代码目录。没有新增生产变量。
+
+升级前快照位于 `<buckets>/.clockworkkoi-upgrade-backups/before-3.6.15/`，包含私有只读归档与校验清单。复制前后逐文件核对，验证整包和各文件 SHA256 及 SQLite 完整性；空间不足、路径不明确、快照损坏或复制期间变化都会阻止启动。重启复用并重新验证原快照，绝不把已迁移的数据冒充迁移前快照。首次空库只记录初始化标记。该目录含私密内容，不能公开上传；**同卷快照只用于本次软件升级回退，不替代独立异地备份**。
+
+离线恢复操作（所有应用进程必须先停止）：
+
+```sh
+python /app/deploy/clockworkkoi_upgrade_guard.py verify --backup-id before-3.6.15
+python /app/deploy/clockworkkoi_upgrade_guard.py restore --backup-id before-3.6.15 \
+  --destination /app/buckets/.clockworkkoi-upgrade-backups/restores/pre-3.6.15 --offline
+```
+
+恢复命令先保存当前完整状态，再在全新目录中生成旧快照副本和私有 `RESTORE_MAP.json`；不覆盖活动记忆。按映射将数据、配置和代码路径切换到恢复副本，同时部署匹配的旧提交 `8632dd3551961532f4dda87492d65f6c469c7c42`。生产单根布局下，新数据路径为上述目标内的 `root-0`，配置与 `_app` 相应位于其中。恢复前生成的当前状态快照必须保留，以便核对升级后新增的记忆。跨主版本或版本未知的 `_prev` 自动回退被明确阻止，需按上述步骤恢复成套数据与代码。
+
+此升级保留自主普通记忆说明与 `source_read` 精确原文核对，并保留 Railway 不使用 Docker `VOLUME` 指令的适配；`You` / `Them` 默认关闭，升级不主动启用。请通过固定 testing 提交的隔离容器验证后再发布 main，禁止用真实记忆执行测试。
+
 ## 安全部署向导
 
 首次登录后打开 `/onboarding`，只选择部署意图：
@@ -28,6 +50,8 @@ Docker/Zeabur 的持久卷统一挂载 `/app/buckets`，配置路径为 `/app/bu
 - 本地导出的 ZIP 同样是未加密的敏感资产；应加密保管或放入可信存储，并在传输后清理不再需要的临时副本。
 - `embeddings.db`、BM25 缓存和脱水缓存都是可重建的派生数据。
 - `.embedding_outbox.json` 只保存待索引 ID、内容哈希和重试状态，不复制记忆正文。
+- `<buckets_dir>/.you/you.sqlite3` 是“你 / You”首次开启后才创建的派生认识库，保存作用域、Claim、跨日重申收据和 Projection；自动派生时代的旧快照可能额外带无消费者的 `outbox` 表。关闭开关会立即移除 `You` MCP 工具并拒绝读写/撤回，但不删除既有状态，也不影响其余 MCP 工具。
+- `<buckets_dir>/.them/them.sqlite3` 是“其他人 / them”首次开启后才创建的独立派生认识库，保存作用域、按人分份的名册与 Claim；它与 You 分库，没有 Projection 或 outbox。关闭开关会移除 `Them` MCP 工具并保留既有状态。人类可见的称呼、可见转述与一次性纠错提示也随该库备份。
 - `config.yaml`、`.env`、API Key、OAuth/Tunnel token 不进入本地记忆导出包。
 
 ## 写入与恢复保证
@@ -36,9 +60,13 @@ Docker/Zeabur 的持久卷统一挂载 `/app/buckets`，配置路径为 `/app/bu
 2. 连续 provider 故障会打开全局熔断，避免每条待办都重复撞击同一个故障端点；冷却后自动恢复，也可在 Dashboard 手动补齐。
 3. Obsidian、Git 或手工修改 Markdown 后，BucketManager 会按配置的轮询间隔发现文件集合/mtime/size 变化，刷新内存与 BM25，并只对正文变化重新排队向量。
 4. 本地导出对正在使用的 SQLite 调用 backup API，得到事务一致快照；不会直接复制可能处于 WAL 写入中的数据库文件。
-5. v2.10.1 起，新导出会同时包含 `buckets/*.md`、`sources/src_<sha256>.source` 和 `backup_manifest.json`，逐文件记录字节数与 SHA-256。恢复预检要求清单与 ZIP 内容完全一致，并校验证据文件名哈希、UTF-8、大小和路径。
+5. v2.10.1 起，新导出会同时包含 `buckets/*.md`、`sources/src_<sha256>.source` 和 `backup_manifest.json`，逐文件记录字节数与 SHA-256。创建过模块库的实例还会包含事务一致的 `you/you.sqlite3` 和/或 `them/them.sqlite3`；GitHub 备份中的对应路径为 `.you/you.sqlite3` 与 `.them/them.sqlite3`。恢复预检要求清单与归档/远端文件集合一致，并校验每个成员的大小与 SHA-256。
 6. 迁移执行时先安装全部已校验证据，再写入引用它们的桶。v2.10.0 旧包缺证据时仍可恢复事件桶，但界面会明确提示这些原文不可核对，不会伪装成完整证据恢复。
 7. 当前版本创建的新本地/GitHub 备份会交叉检查桶的 `source_refs`；任一引用缺文件或格式非法时整次备份失败。GitHub 恢复先把全部远端 blob 暂存并验证，再安装全部证据，最后才覆盖 Markdown。
+8. You 与 them 快照在导出和恢复前都会只读执行 SQLite `PRAGMA quick_check`，核对固定表/索引、唯一模块状态、完整 Scope，并反序列化每条记录检查作用域一致性；任一检查失败都拒绝发布该快照。
+9. 本地记忆包迁移只有在所有桶按原 ID 完整导入时才安装 You / them 快照；出现 `skip`、`keep_both` 或其他 ID 变化时会记录“快照未恢复”，并保留当前模块库。安装采用同目录临时文件 + `fsync` + `os.replace`，完成后重新同步各自工具；同步失败时把对应模块按关闭处理。
+10. 派生 SQLite（`embeddings.db`、`dehydration_cache.db`）在启动时打不开会被自动隔离成 `<原名>.corrupt-<时间戳>`，随即重建空库继续启动。这两个库都不含真源数据，向量与摘要会按需重新生成。**服务不会因为派生索引损坏而拒绝启动**——那等于让用户为了一个缓存丢掉全部记忆的访问权。
+11. GitHub 恢复会在写入 vault 前验证 `.you/you.sqlite3` 与 `.them/them.sqlite3`，但当前 Web 恢复处理只主动刷新 `You` 的运行时门禁，没有刷新 `Them`。恢复包含 them 的仓库后应重启服务，再让 MCP 客户端刷新工具列表；磁盘上的 `.them/them.sqlite3` 在重启前已经恢复，但当前进程可能仍使用旧开关缓存/工具显隐。
 
 清单只能发现残缺或意外篡改，不能证明备份由谁创建。需要来源认证时，应在可信存储或带签名的发布/备份系统中保管 ZIP。
 
@@ -71,8 +99,10 @@ python tools/check_buckets.py --json
 2. 准备一个全新的临时 vault/测试实例，不要直接覆盖唯一的生产目录。
 3. 在迁移页面上传 ZIP。新包应显示“备份清单与 SHA-256 校验通过”；无清单旧包会显示“未验证”，有原文引用但缺证据的 v2.10.0 包会显示兼容性警告。
 4. 检查 bucket 数、冲突决策和 embedding 模型/维度，再执行导入。
-5. 导入完成后运行 `python tools/check_buckets.py`，并用 `breath_search(query=...)` 抽查可检索性；若测试包含原文证据，再用准确桶 ID + 标题调用一次 `source_read(scope="event")`，确认事件范围可读且未带出范围外文字。
+5. 导入完成后运行 `python tools/check_buckets.py`，并用 `breath_search(query=...)` 抽查可检索性；若测试包含原文证据，检查 `<vault>/_sources/` 下的 `.source` 文件已随导入落盘（3.0.0 起没有回读工具，原文只能从磁盘核对）。
 6. 确认 outbox 待处理数最终回到 0。模型离线时允许保持 pending，但 Markdown 必须完整可读。
+7. 若备份包含 You / them，登录 Dashboard 检查两个独立开关；本地记忆包迁移会自动同步门禁，GitHub 恢复包含 them 时按上节说明重启服务。让 MCP 客户端重新获取工具列表：两个都关为 16 个基础工具，只开一个为 17 个，两个都开为 18 个；新增项应分别只有 `You` / `Them`。
+8. You 没有 Dashboard 条目浏览入口；them 可用名册核对人名与来源分组，但不要把人类看不到的第一手 Claim 正文当作恢复验收项。
 
 导入冲突的语义：
 
@@ -89,7 +119,14 @@ python tools/check_buckets.py --json
 | Obsidian 修改后结果旧 | 等待外部变更轮询周期 | 检查 `storage.external_change_poll_seconds`，再看系统诊断的外部变更计数 |
 | ZIP 上传被拒绝 | 本地 vault 未写入 | 按错误修复损坏、路径穿越、重复项或清单不一致，重新导出 |
 | SQLite quick_check 失败 | Markdown 真源通常仍在 | 先备份 Markdown，移走损坏的派生库，再重建向量；不要删除 Markdown |
+| 记忆库里出现 `embeddings.db.corrupt-<时间戳>` 或 `dehydration_cache.db.corrupt-<时间戳>` | 对应派生库启动时打不开，已被自动隔离并重建；Markdown 未受影响 | 确认服务已正常启动、向量在后台补齐后，这些隔离文件可以删除。留着只为取证，不会被读取 |
 | outbox 长时间不下降 | 记忆正文仍安全 | 查看熔断状态、最近错误、Key/模型/维度和 provider 连通性 |
+| You 开关保存失败或开启后工具列表没有 `You` | 系统保持关闭或立即回退为关闭；其余 MCP 工具不受影响 | 查看服务日志与 `<buckets_dir>/.you/` 的写入权限；修复后重新开启，并让 MCP 客户端刷新工具列表或重连 |
+| MCP 客户端在关闭 You 后仍尝试调用旧工具 | 服务端返回 `Unknown tool: You`，不会读取或返回派生认识 | 让客户端重新获取工具列表或重连；不要为兼容旧缓存保留一个可调用的空壳工具 |
+| them 开关保存失败或开启后工具列表没有 `Them` | 系统保持关闭或立即回退为关闭；You 与其余 MCP 工具不受影响 | 查看服务日志与 `<buckets_dir>/.them/` 的写入权限；修复后重新开启，并让 MCP 客户端刷新工具列表或重连 |
+| MCP 客户端在关闭 them 后仍尝试调用旧工具 | 服务端返回未知工具，不会读取或返回 them 认识 | 让客户端重新获取工具列表或重连；不要保留关闭态空壳工具 |
+| GitHub 恢复显示 them 已导入，但当前工具清单/开关仍是恢复前状态 | `.them/them.sqlite3` 已写入，当前 Web 路径未刷新 `ThemToolGate` 与状态缓存 | 重启 Ombre，再刷新 Dashboard 与 MCP 工具列表；重启前不要继续编辑 them 名册 |
+| You / them 快照在 ZIP 或 GitHub 恢复时被拒绝 | 模块库不会发布；本地记忆包迁移保留当前模块状态，GitHub 整次预检失败时不写入本地 vault | 按错误检查 `quick_check`、schema、Scope、清单 SHA-256 与路径；不要手工绕过验证覆盖 SQLite |
 | nginx 下输入正确 Dashboard 密码却提示密码错误 | v2.10.1 及更早版本会把代理返回的 HTML、空响应或网关错误统一回退为“密码错误” | 升级到 2.10.2+ 后按页面显示的真实类型处理；同时检查 `/auth/login` 状态码、下方完整 nginx 转发头和 `OMBRE_TRUSTED_PROXY_CIDRS`。若返回 200 但会话未建立，核对 `X-Forwarded-Proto` 与 `Set-Cookie` |
 | 编辑记忆、热更新或重启提示 `Cross-origin request rejected` | 写请求被来源防护拒绝，原数据未改动；这不是 CORS 缺失 | 优先手动升级到 2.7.1+；nginx 必须保留公网 authority，传入 `X-Forwarded-Proto: https`，并让应用精确信任最后一跳代理 CIDR。不要添加 CORS 头或改写浏览器 `Origin` |
 | Polaris 报 `Failed to fetch`，`/health` 为 200，但 `OPTIONS /mcp` 为 401 且无 CORS 头 | 2.8.1 及更早版本中 CORS 位于 MCP 鉴权内层，静态 Token 模式错误拦截了不携带 Token 的浏览器预检 | 升级到 2.8.2+ 并重建/重启服务；确认预检返回 200，且响应包含 `Access-Control-Allow-Origin`、允许 `POST` 和客户端使用的 Token 请求头 |

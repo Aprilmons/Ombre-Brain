@@ -27,6 +27,9 @@ class DeleteRequest:
     path_params = {"letter_id": "letter-ghost"}
     query_params = {"confirm": "true"}
 
+    async def json(self):
+        return {}
+
 
 class MissingBucketManager:
     def __init__(self):
@@ -68,7 +71,7 @@ def test_dashboard_offers_one_way_legacy_letter_conversion_to_ai_ownership():
 
 
 @pytest.mark.asyncio
-async def test_delete_missing_letter_repairs_vector_and_runtime_cache(monkeypatch):
+async def test_delete_missing_letter_repairs_vector_and_runtime_cache(monkeypatch, tmp_path):
     manager = MissingBucketManager()
     deleted_vectors = []
     monkeypatch.setattr(letters.sh, "_require_auth", lambda request: None)
@@ -77,6 +80,13 @@ async def test_delete_missing_letter_repairs_vector_and_runtime_cache(monkeypatc
         letters.sh,
         "embedding_engine",
         SimpleNamespace(delete_embedding=deleted_vectors.append),
+    )
+    from deletion_requests import DeletionRequestStore
+
+    monkeypatch.setattr(
+        letters.sh,
+        "deletion_requests",
+        DeletionRequestStore(str(tmp_path), manager, letters.sh.embedding_engine),
     )
     mcp = FakeMCP()
     letters.register(mcp)
