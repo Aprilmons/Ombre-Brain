@@ -13,6 +13,7 @@ tools/hold/feel.py — hold(feel=True) 分支
 - iter 2.0：bucket_id 用人类可读命名 ``feel_YYYYMMDDHHMM_V<valence*100>``
   （分钟精度 + valence 后缀），冲突时由 bucket_manager.create() 自动追加秒后缀
 - iter 2.0：source_tool="hold"（feel 在 hold 工具的 feel=True 分支里）
+- source_bucket 可省略，独立感受不建立来源关联，也不修改其他记忆
 - 如果带了 source_bucket，把源记忆标为 digested 并存入「我视角的 valence」
 - embedding 由 create() 尝试同步生成；不可用时仍保留逐字原文，稍后可 backfill
 

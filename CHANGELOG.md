@@ -2,6 +2,12 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 3.6.17（ClockworkKoi 定制）
+
+- 修复 `hold(feel=True)` 在省略 `source_bucket` 时被入口错误拒绝的问题；独立感受不建立虚假来源，也不修改其他记忆。
+- 工具说明与示例明确区分独立感受和对已有记忆的回顾；后者仍将准确来源标为已消化，显式 valence 仍写入对原记忆的情绪评价。
+- 补充公开 MCP 写入、回读及有来源路径的隔离回归测试；没有配置、环境变量或存储格式变更。
+
 ## 3.6.16（ClockworkKoi 定制）
 
 - `hold.quotes` 与 `trace.quotes_replace` 的工具说明及使用示例统一为对象数组，与公开 MCP 参数定义一致；底层仍保留字符串简写兼容。
