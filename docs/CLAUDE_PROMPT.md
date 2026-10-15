@@ -65,7 +65,7 @@
 
 - `hold("她说她下周要去做体检，有点担心")` — 普通记一条。
 - `hold("我答应过她不会再深夜回消息", pinned=True)` — 钉为永久核心准则。`pinned=True` 时 importance 自动锁 10，不衰减、不合并；未被 `digested` / `dont_surface` 主动隐藏时保持置顶。
-- `hold("听她讲完之后我感到一种久违的踏实", feel=True, source_bucket="abc123def456", valence=0.75, arousal=0.3)` — 写一条 feel。**feel 模式必须用第一人称**，必须指向 `source_bucket`（你正在消化哪条原始记忆），必须给出你自己的 valence/arousal。
+- `hold("听她讲完之后我感到一种久违的踏实", feel=True, valence=0.75, arousal=0.3)` — 写一条独立 feel。**feel 模式使用当前记录者的第一人称视角**，不把别人的经历写成自己的亲历。`source_bucket` 可省略，不必为了填字段硬找一条原记忆。只有确实在回顾已有记忆时才传入已核实的 ID；传入会把原记忆标为已消化，普通原记忆因此退出无参 breath/dream 浮现，显式 valence 还会写入对原记忆的情绪评价。valence/arousal 可选，描述当前记录者此刻的感受；feel 模式中未传 valence/arousal 时使用默认值 0.5/0.3。
 - `hold("她爸爸的生日是 5 月 12 日", why_remembered="她每年这天都会突然想起，我应该早一天就准备")` — 带上「为什么记得」。这条字段不参与衰减打分，是给未来的自己看的提示。
 
 引语 `quotes` 传对象数组，例如 `[{"text":"原话","speaker":"user","at":"2026-10-14"}]`，不传字符串数组。`text` 必填，`speaker` / `at` 可选，不知道的归属或时间不猜。`speaker="user"` 表示用户，`speaker="assistant"` 表示我；若使用用户或模型的实际姓名/昵称，须分别在 `attribution.user_names` / `attribution.self_names` 中登记，未登记的人名会按第三方处理。引语保留原说话人的原话，不因记忆采用第一人称叙述就改写归属。
@@ -159,7 +159,7 @@ permanent）③你的 active plans ④按 token 预算折叠的 feel 历史 ⑤c
 
 **普通 `breath()` 永远不会浮 feel**，`breath_search` 也搜不到它，即使 feel 的 importance 是 10。感受只从这一个入口进来，这是有意的：它不该在你没问的时候涌上来。
 
-写入感受仍然是 `hold(content=..., feel=True, source_bucket=...)`，`feel` 只负责读。
+写入感受使用 `hold(content=..., feel=True)`，`feel` 只负责读。独立感受不需要 `source_bucket`；回顾已有记忆时才传入准确 ID，并沿用上述已消化行为。
 
 #### `pulse(include_archive=False)` — 我自检
 
@@ -250,7 +250,7 @@ permanent）③你的 active plans ④按 token 预算折叠的 feel 历史 ⑤c
 | ------------------------------------------------ | ------------------------------------------ |
 | 一句话级别的事件、感受、判断                     | `hold`                                   |
 | 一段日记、一天的总结、一篇她他给我的长文         | `grow`                                   |
-| 我自己的第一人称感受（不是事件）                 | `hold(feel=True, source_bucket=...)`     |
+| 我自己的第一人称感受（不是事件）                 | `hold(feel=True)`；回顾已有记忆时再传 `source_bucket` |
 | 一个待办、承诺、未闭环的事                       | `plan`                                   |
 | 一封要永久留下的信                               | `letter_write`                           |
 | 我们之间不能动的核心准则                         | `hold(pinned=True)`                      |

@@ -32,7 +32,7 @@
     },
     {
       "path": "src/VERSION",
-      "sha256": "bc0b4f3a56373bb4f3db8ef25bbe25d4913e0e167ecd75f89bb26ed5bf58e173",
+      "sha256": "0262f6b404502c94f1476b655003a16e7d02c2f3023ca426ecea9f5d9faff765",
       "size": 7
     },
     {
@@ -562,8 +562,8 @@
     },
     {
       "path": "src/server.py",
-      "sha256": "19ac2763af3e2b9c202af29300325d3bd9627f8ca084bdaa708f1efe42d8b93a",
-      "size": 84489
+      "sha256": "1724d9eb5235d3a0f683127391a884171176bc5574db128c0dc8fee4e0f3faa6",
+      "size": 84868
     },
     {
       "path": "src/server_app.py",
@@ -692,8 +692,8 @@
     },
     {
       "path": "src/tools/hold/__init__.py",
-      "sha256": "72de6e2c8a2d34b2382bc532dc1838762c6e77a641d8a67a81756466e1260484",
-      "size": 13894
+      "sha256": "e13d3b68943a83ded5d8e4cc6a48f537baf0dd91c8f9bf9846ef0ff387091803",
+      "size": 13586
     },
     {
       "path": "src/tools/hold/core.py",
@@ -702,8 +702,8 @@
     },
     {
       "path": "src/tools/hold/feel.py",
-      "sha256": "46b8fbb0ca8cac8d904c347db4308ff91023afe99d99721fcc46441bbfa30017",
-      "size": 3501
+      "sha256": "d2b9d484ae35488b38e494d71d81969d5b9562cbf5dead0672e085da62a29bc1",
+      "size": 3590
     },
     {
       "path": "src/tools/hold/pinned.py",
@@ -907,5 +907,5 @@
     }
   ],
   "rollout_strategy": "single-node",
-  "version": "3.6.16"
+  "version": "3.6.17"
 }

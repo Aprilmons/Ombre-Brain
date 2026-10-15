@@ -14,7 +14,7 @@
 之前就返回了。用 `return "错误说明"` 表达这种失败，等于把失败
 伪装成一次正常返回。
 
-本文件锁定的契约：hold 遇到这九种参数问题时抛异常，MCP 侧因此
+本文件锁定的契约：hold 遇到下列参数问题时抛异常，MCP 侧因此
 得到 isError=True，且错误正文里带得上原因（模型要靠它自我纠正）。
 
 不包含降级提示：`👣 Footprint：暂时无法读取` 这类是「主体成功了，
@@ -46,11 +46,6 @@ from mcp.server.fastmcp.exceptions import ToolError
         "内容为空存不进去",
         {"content": "   "},
         "内容为空",
-    ),
-    (
-        "feel 必须指向一条原始记忆",
-        {"content": "今天很累", "feel": True},
-        "source_bucket",
     ),
     (
         "source_ranges 不能脱离 source_content 单独出现",

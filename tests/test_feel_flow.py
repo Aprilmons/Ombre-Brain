@@ -268,3 +268,84 @@ class TestFeelLifecycle:
         all_b = await bm.list_all()
         feels = [b for b in all_b if b["metadata"].get("type") == "feel"]
         assert len(feels) >= 4  # enough for crystallization detection
+
+
+@pytest.fixture
+def public_feel_tools(bucket_mgr, decay_eng, test_config, monkeypatch):
+    """用真实临时存储经过 MCP 注册入口；只隔离后台调度和外部模型。"""
+    from unittest.mock import AsyncMock
+    import logging
+    import server
+    from tools import _runtime as rt
+
+    monkeypatch.setattr(decay_eng, "ensure_started", AsyncMock())
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "decay_engine", decay_eng)
+    monkeypatch.setattr(rt, "config", test_config)
+    monkeypatch.setattr(rt, "embedding_engine", None)
+    monkeypatch.setattr(rt, "logger", logging.getLogger("test_feel_flow"))
+    monkeypatch.setattr(rt, "mark_op", None)
+    monkeypatch.setattr(rt, "record_v3_tool_event", lambda *_args, **_kwargs: None)
+    return server.mcp._tool_manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_args", [{}, {"source_bucket": ""}, {"source_bucket": " \t "}, {"source_bucket": None}],
+    ids=["省略", "空字符串", "纯空白", "null"],
+)
+async def test_public_hold_standalone_feel_round_trip(
+    public_feel_tools, bucket_mgr, monkeypatch, source_args,
+):
+    """独立感受从公开入口原样落库、可回读，且不修改其他记忆。"""
+    from unittest.mock import AsyncMock
+
+    original_id = await bucket_mgr.create(
+        content="这是另一条普通记忆。", tags=[], importance=5, domain=["general"],
+        valence=0.5, arousal=0.3, name=None,
+    )
+    original = await bucket_mgr.get(original_id)
+    update_spy = AsyncMock(wraps=bucket_mgr.update)
+    monkeypatch.setattr(bucket_mgr, "update", update_spy)
+    body = "我此刻感到一种安静的踏实。\n这个感受不需要另找一条来源。"
+    result = await public_feel_tools.get_tool("hold").run({
+        "content": body, "feel": True, **source_args,
+    })
+    assert "🫧feel→" in str(result)
+    feels = [b for b in await bucket_mgr.list_all() if b["metadata"].get("type") == "feel"]
+    assert len(feels) == 1
+    stored = feels[0]
+    assert stored["content"] == body
+    assert stored["metadata"]["domain"] == ["feel"]
+    assert stored["metadata"]["source_tool"] == "hold"
+    assert not stored["metadata"].get("triggered_by")
+    update_spy.assert_not_awaited()
+    assert await bucket_mgr.get(original_id) == original
+
+    recalled = await public_feel_tools.get_tool("feel").run({"query": "安静的踏实"})
+    assert body in str(recalled)
+    surfaced = await public_feel_tools.get_tool("breath").run({})
+    assert "OB-E004" not in str(surfaced)
+    assert body not in str(surfaced)
+
+
+@pytest.mark.asyncio
+async def test_public_hold_sourced_feel_keeps_existing_digestion(public_feel_tools, bucket_mgr):
+    """允许独立感受后，明确回顾原记忆仍保留既有来源与消化行为。"""
+    body = "我们一起完成了一个修复。"
+    original_id = await bucket_mgr.create(
+        content=body, tags=[], importance=5, domain=["general"],
+        valence=0.5, arousal=0.3, name=None,
+    )
+    result = await public_feel_tools.get_tool("hold").run({
+        "content": "回顾那次合作，我感到很踏实。", "feel": True,
+        "source_bucket": original_id, "valence": 0.75, "arousal": 0.3,
+    })
+    assert "🫧feel→" in str(result)
+    original = await bucket_mgr.get(original_id)
+    assert original["content"] == body
+    assert original["metadata"]["digested"] is True
+    assert original["metadata"]["model_valence"] == 0.75
+    feels = [b for b in await bucket_mgr.list_all() if b["metadata"].get("type") == "feel"]
+    assert len(feels) == 1
+    assert feels[0]["metadata"]["triggered_by"] == original_id

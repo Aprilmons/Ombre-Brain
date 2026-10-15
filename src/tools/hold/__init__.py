@@ -241,12 +241,6 @@ async def dispatch(
     else:
         extra_tags = [t.strip() for t in str(tags).split(",") if t.strip()]
 
-    if feel and (not source_bucket or not source_bucket.strip()):
-        raise ToolInputError(
-            "feel 必须指向一条原始记忆（source_bucket 不能为空）。请先用 "
-            "breath_search(query=...) 找到那条桶的 bucket_id，再传入 source_bucket=id。"
-        )
-
     # 媒体的持久化在建桶那一步，比下面 _prepare_source_refs 写原文证据晚。
     # 等到那时才失败，原文已经落进 _sources，而错误正文说的是「未创建任何桶」
     # ——调用方据此重试，上一半副作用已经在那了。真机复现过：

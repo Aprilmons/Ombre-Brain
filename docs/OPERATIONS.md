@@ -30,6 +30,12 @@ Railway 健康检查设置为 `/health`、超时 300 秒，同时必须显式配
 
 本次部署在旧实例停止、持久卷独占后，先核验已有 `before-3.6.15` 迁移前完整快照，并为当前配置单独保存私有只读副本及 SHA256；不把已有 3.x 数据冒充迁移前快照。随后通过 `atomic_update_config_yaml` 向现有 `attribution.user_names` 追加 Rocky、April，保留其他配置并回读核验。配置修正完成后恢复正常启动命令。仍使用现有 `OMBRE_CONFIG_PATH`、`OMBRE_BUCKETS_DIR`、`OMBRE_VAULT_DIR`、`OMBRE_CODE_DIR`、`OMBRE_IMAGE_ROOT`，没有新增生产环境变量，也不改记忆或数据库格式。
 
+## ClockworkKoi 3.6.17 独立感受修正
+
+移除 `hold(feel=True)` 对空 `source_bucket` 的错误拦截，底层继续使用已有 feel 存储和检索路径；无需数据迁移、配置修改或新增环境变量。升级不回写旧记忆。省略来源不会更新其他桶；显式传入准确来源仍会将其标为已消化，显式 valence 仍会写入原记忆的 model_valence。
+
+先在隔离 vault 中通过公开 MCP 验证独立感受的写入与 `feel(query=...)` 回读，以及有来源时的消化行为，再发布生产。生产升级继续保留完整数据快照要求；客户端重连后核对 `hold` / `feel` 的工具说明是否已刷新。
+
 ## 安全部署向导
 
 首次登录后打开 `/onboarding`，只选择部署意图：

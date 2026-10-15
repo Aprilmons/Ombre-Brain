@@ -528,13 +528,24 @@ def test_source_read_checks_saved_evidence_and_denies_deleted_buckets(mcp_client
         })
 
 
+def test_hold_standalone_feel_can_be_recalled(mcp_client):
+    # 仅在文件级指定的隔离服务中写入，feel 不允许伪装成可物理删除的测试桶。
+    marker = _marker("standalone-feel")
+    body = f"我此刻想记住这份踏实：{marker}"
+    result = mcp_client.call("hold", {"content": body, "feel": True})
+    assert "🫧feel→" in result
+    recalled = mcp_client.call("feel", {"query": marker})
+    assert body in recalled
+    assert marker not in mcp_client.call("breath")
+
+
 def test_hold_rejects_invalid_feel_and_test_data_combinations(mcp_client):
-    missing_source = _rejection_text(
+    invalid_feel = _rejection_text(
         mcp_client,
         "hold",
-        {"content": _marker("feel"), "feel": True, "valence": 0.5, "arousal": 0.5},
+        {"content": _marker("feel"), "feel": True, "test_data": True},
     )
-    assert "source_bucket 不能为空" in missing_source
+    assert "测试数据不能创建为 pinned 或 feel" in invalid_feel
 
     non_erasable_mode = _rejection_text(
         mcp_client,
